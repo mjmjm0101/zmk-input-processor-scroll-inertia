@@ -81,7 +81,7 @@ scroll layer by using two helper modifiers:
 
 You're still declaring your intent to the firmware — just through a
 modifier instead of a layer change.  The core principle is unchanged:
-no guessing, no stuck axes, no friction.
+no guessing, no stuck axes, deterministic behaviour at every angle.
 
 > **Pick the modifiers carefully.**  They are sent to the host while
 > held, so they can collide with host shortcuts (e.g. Cmd/Ctrl + scroll
@@ -203,6 +203,20 @@ A note on units: several properties take values "out of 1000"
 (sometimes called *permille*).  For example, a decay rate of `990`
 means *multiply velocity by 0.990 each tick*.  This avoids floating-point
 math on the keyboard.
+
+A note on safe ranges: the module assumes sensible values and does not
+fight you if you set unusual ones.  The two values that *would* crash
+or busy-loop are guarded internally — `scale-div = 0` is treated as
+`1`, and `tick = 0` is treated as `1` ms.  Other parameters follow
+GIGO: out-of-range values just produce out-of-range behaviour.
+Recommended ranges:
+- `gain` + `blend` should add to `1000` (otherwise the EMA is
+  unstable: it grows unbounded if the sum exceeds 1000, or under-tracks
+  if it is below).
+- `decay-fast`, `decay-slow`, `decay-tail` in `[800, 999]`.  Values
+  ≥ 1000 prevent decay (velocity grows or holds forever).
+- `slow` ≤ `fast` (the multi-stage check assumes ascending boundaries;
+  inverting them silently disables the mid stage).
 
 | Property | Default | Description |
 |---|---|---|

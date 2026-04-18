@@ -71,6 +71,26 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * from cursor mode to scroll mode). */
 #define MIN_TRACKING_EVENTS  10
 
+/* ------------------------------------------------------------------
+ * Concurrency model
+ * ------------------------------------------------------------------
+ * All three handlers below
+ *   - scroll_inertia_handle_event() (input subsystem callback)
+ *   - inertia_tick_handler()        (k_work_delayable)
+ *   - stop_detect_handler()         (k_work_delayable)
+ * are normally serialised on the Zephyr system workqueue under the
+ * standard ZMK input-listener path, so they cannot preempt each other
+ * and the per-instance `scroll_inertia_data` is accessed from a single
+ * thread of control at a time.
+ *
+ * Should a downstream integration ever route input events from a
+ * different context (ISR or driver thread), most fields are int32_t
+ * which are single-instruction loads/stores on Cortex-M and therefore
+ * naturally atomic; the worst observable effect would be one tick
+ * working from a value that's one update old.  We deliberately keep
+ * the implementation lock-free for simplicity and predictability.
+ * ------------------------------------------------------------------ */
+
 /* ------------------------------------------------------------------ */
 /* Configuration (read from Devicetree at compile time)                */
 /* ------------------------------------------------------------------ */
@@ -127,7 +147,12 @@ struct scroll_inertia_data {
     int32_t tracking_count;
 
     /* Buffered non-tracked-axis value, awaiting merge into the
-     * tracked axis via fast_magnitude(). */
+     * tracked axis via fast_magnitude().  Single slot by design:
+     * input devices report X and Y in pairs, so the buffered value is
+     * normally consumed by the very next event of the tracked axis.
+     * If the same non-tracked axis fires twice in a row (rare), the
+     * older value is overwritten — accepted as a small magnitude loss
+     * rather than carrying a queue. */
     int32_t pending_other;
 
     /* Sub-unit scroll accumulators */
@@ -190,6 +215,13 @@ static inline int32_t clamp_velocity(int32_t vel, int32_t limit_fp) {
     return vel;
 }
 
+/* Defensive guards against pathological DT values.  We don't try to
+ * "auto-correct" every odd setting (that would silently mask user
+ * mistakes); we only protect against the two values that would crash
+ * or busy-loop: a zero divisor and a zero tick interval. */
+static inline int32_t safe_scale_div(int32_t v) { return v > 0 ? v : 1; }
+static inline int32_t safe_tick_ms(int32_t v)   { return v > 0 ? v : 1; }
+
 static void reset_state(struct scroll_inertia_data *data) {
     data->vel_x = 0;
     data->vel_y = 0;
@@ -222,7 +254,7 @@ static void start_inertia(struct scroll_inertia_data *data,
     LOG_DBG("Inertia start  vel_y=%d vel_x=%d  mov=%d",
             data->vel_y, data->vel_x, data->total_movement);
 
-    k_work_schedule(&data->inertia_tick_work, K_MSEC(cfg->tick_ms));
+    k_work_schedule(&data->inertia_tick_work, K_MSEC(safe_tick_ms(cfg->tick_ms)));
 }
 
 /* ------------------------------------------------------------------ */
@@ -283,13 +315,14 @@ static void inertia_tick_handler(struct k_work *work) {
     /* Accumulate sub-unit values and emit integer scroll deltas */
     int16_t emit_x = 0, emit_y = 0;
 
+    int32_t sdiv = safe_scale_div(cfg->scale_div);
     if (ax != AXIS_X) {
-        data->accum_y += (int64_t)data->vel_y * cfg->scale / cfg->scale_div;
+        data->accum_y += (int64_t)data->vel_y * cfg->scale / sdiv;
         emit_y = (int16_t)(data->accum_y >> FP_SHIFT);
         data->accum_y -= (int32_t)emit_y << FP_SHIFT;
     }
     if (ax != AXIS_Y) {
-        data->accum_x += (int64_t)data->vel_x * cfg->scale / cfg->scale_div;
+        data->accum_x += (int64_t)data->vel_x * cfg->scale / sdiv;
         emit_x = (int16_t)(data->accum_x >> FP_SHIFT);
         data->accum_x -= (int32_t)emit_x << FP_SHIFT;
     }
@@ -308,7 +341,7 @@ static void inertia_tick_handler(struct k_work *work) {
         zmk_hid_mouse_scroll_set(0, 0);
     }
 
-    k_work_schedule(&data->inertia_tick_work, K_MSEC(cfg->tick_ms));
+    k_work_schedule(&data->inertia_tick_work, K_MSEC(safe_tick_ms(cfg->tick_ms)));
 }
 
 /* ------------------------------------------------------------------ */
@@ -428,7 +461,7 @@ static int scroll_inertia_handle_event(const struct device *dev,
      * stopped or the layer was briefly toggled.  Either way, the
      * inertia belongs to a previous interaction and must end. */
     if (data->inertia_active && data->last_event_time > 0 &&
-        now - data->last_event_time > cfg->tick_ms * 2) {
+        now - data->last_event_time > safe_tick_ms(cfg->tick_ms) * 2) {
         need_reset = true;
     }
 

@@ -393,6 +393,15 @@ goes from full speed to zero with no gradual slowdown to detect.
 
 ---
 
+## Project status
+
+This project is feature-complete for its intended purpose.
+
+I may update it for critical bugs or major ZMK breaking changes, but
+I do not plan frequent feature additions.
+
+---
+
 ## License
 
 MIT

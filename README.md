@@ -208,8 +208,8 @@ math on the keyboard.
 |---|---|---|
 | `gain` | `300` | How strongly each new event pulls the smoothed velocity (out of 1000).  Together with `blend`, this controls a moving average: `velocity = (event * gain + velocity * blend) / 1000`. |
 | `blend` | `700` | How much of the previous velocity is kept (out of 1000).  `gain + blend` should equal 1000. |
-| `start` | `75` | The peak velocity (in raw scroll units) that a flick must reach before inertia is allowed to kick in. |
-| `move` | `135` | The total distance the ball must roll within a single flick before inertia is allowed to kick in.  Stops tiny stray motions from triggering it. |
+| `start` | `75` | The peak velocity (in raw scroll units) that a flick must reach before inertia is allowed to kick in.  The default is intentionally on the conservative side so that small, deliberate scrolls don't trigger inertia — tune to taste. |
+| `move` | `135` | The total distance the ball must roll within a single flick before inertia is allowed to kick in.  Stops tiny stray motions from triggering it.  Same as `start`, the default is conservative; raise it if even casual scrolls trigger inertia, lower it if real flicks fail to. |
 | `release` | `24` | If no events arrive for this many milliseconds, the ball is treated as released (~3 frames at 125 Hz). |
 | `fast` | `0` | Velocity boundary between the fast and mid decay zones.  `0` disables zoning (single curve). |
 | `decay-fast` | `990` | High-speed decay (out of 1000 per tick).  990 means `velocity *= 0.990` each tick. |

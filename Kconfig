@@ -1,0 +1,9 @@
+config ZMK_INPUT_PROCESSOR_SCROLL_INERTIA
+    bool "Scroll Inertia input processor"
+    default y
+    depends on DT_HAS_ZMK_INPUT_PROCESSOR_SCROLL_INERTIA_ENABLED
+    select ZMK_POINTING
+    help
+      Enable the scroll-inertia input processor.  Adds iOS-like inertial
+      scrolling that takes over from physical trackball input at the
+      moment the user begins to release the flick.

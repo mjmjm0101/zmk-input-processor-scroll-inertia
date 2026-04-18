@@ -1,0 +1,206 @@
+description: |
+  Input processor that adds inertial scrolling to trackball scroll mode.
+  Tracks scroll velocity and generates decaying scroll events after the
+  trackball stops moving.  Designed for BLE keyboards with integer-only math.
+
+  Recommended placement: BEFORE zip_scroll_scaler in the input-processors
+  chain, with scale / scale-div set to match the scaler's two arguments.
+
+    Example chain:
+      &zip_y_scaler (-1) 1
+      &zip_xy_to_scroll_mapper
+      &scroll_inertia          ← place here
+      &zip_scroll_scaler 4 675
+
+    Matching binding:
+      scale     = <4>;
+      scale-div = <675>;
+
+  This placement gives the processor higher-precision velocity tracking
+  (pre-scaler values are larger) and avoids the value=0 events the scaler
+  emits while accumulating its remainder.  The scale/scale-div mirror of
+  the scaler's ratio keeps the inertia output aligned with active scroll
+  output, so the transition from physical scroll to inertia is seamless.
+
+compatible: "zmk,input-processor-scroll-inertia"
+
+properties:
+  "#input-processor-cells":
+    type: int
+    required: true
+    const: 0
+  track-remainders:
+    type: boolean
+    description: |
+      Required by ZMK input listener framework.
+      This processor manages its own remainders internally,
+      so this should be left unset (false).
+
+  # ── EMA velocity filter ──────────────────────────────────
+  gain:
+    type: int
+    default: 300
+    description: |
+      EMA input weight (permille).
+      velocity = (delta × gain + velocity × blend) / 1000
+  blend:
+    type: int
+    default: 700
+    description: |
+      EMA history weight (permille).  gain + blend should equal 1000.
+
+  # ── Inertia start conditions ─────────────────────────────
+  start:
+    type: int
+    default: 75
+    description: |
+      Minimum EMA velocity (scroll units) to trigger inertia.
+  move:
+    type: int
+    default: 135
+    description: |
+      Minimum cumulative absolute movement (scroll units) within a
+      gesture required to trigger inertia.  Prevents noise-triggered
+      activation.
+  release:
+    type: int
+    default: 24
+    description: |
+      Milliseconds of no input before the trackball is considered
+      released.  24 ms ≈ 3 frames at 125 Hz.
+
+  # ── Decay ────────────────────────────────────────────────
+  # Defaults give a single iOS-like exponential curve (all rates 990,
+  # boundaries at 0).  Set fast/slow > 0 and use different decay rates
+  # to enable multi-stage behaviour.
+  fast:
+    type: int
+    default: 0
+    description: |
+      Velocity boundary (scroll units) between fast and slow decay
+      zones.  0 disables the fast zone (single curve mode).
+  decay-fast:
+    type: int
+    default: 990
+    description: |
+      High-speed decay rate (permille per tick).
+      990 = multiply by 0.99 each tick.
+  decay-slow:
+    type: int
+    default: 990
+    description: |
+      Mid-speed decay rate (permille per tick).
+  slow:
+    type: int
+    default: 0
+    description: |
+      Velocity boundary (scroll units) between mid and tail decay zones.
+      0 disables the tail zone.
+  decay-tail:
+    type: int
+    default: 990
+    description: |
+      Low-speed tail decay rate (permille per tick).
+      Higher value produces a longer, gentler fade-out.
+  stop:
+    type: int
+    default: 7
+    description: |
+      Velocity (scroll units) below which inertia stops immediately.
+
+      The perceived smoothness at cutoff depends on the *combination* of
+      stop, scale, and scale-div, not on stop alone:
+
+        output frequency at cutoff (Hz) ≈ stop × scale × 125 / scale-div
+
+      Below ~5 Hz the discrete HID scroll units feel jerky.  Tune so the
+      output frequency at cutoff stays above this threshold:
+
+        scale/scale-div ratio | recommended stop (for ~5 Hz cutoff)
+        ─────────────────────────────────────────────────
+        1:1   (1000/1000)    | stop ≈ 1
+        1:10  (100/1000)     | stop ≈ 10
+        4:675 (recommended)  | stop ≈ 7
+        1:100 (10/1000)      | stop ≈ 100
+
+      Lower stop extends the tail but eventually produces sparse,
+      perceptibly discrete output before the actual stop.
+
+  # ── Output ───────────────────────────────────────────────
+  scale:
+    type: int
+    default: 1000
+    description: |
+      Output scale numerator.
+      Inertia scroll output = velocity × scale / scale-div per tick.
+
+      Recommended: place this processor before zip_scroll_scaler and set
+      scale / scale-div to the scaler's two arguments.  The default 1:1
+      (1000/1000) is only correct if the processor sits at the END of the
+      chain (after any scaler), which is not the recommended placement.
+  scale-div:
+    type: int
+    default: 1000
+    description: |
+      Output scale denominator.  See scale.
+  limit:
+    type: int
+    default: 600
+    description: |
+      Maximum velocity cap (scroll units).  Prevents runaway scrolling.
+  span:
+    type: int
+    default: 6000
+    description: |
+      Maximum inertia duration in milliseconds.  Acts as a runaway
+      safety cap; natural decay typically terminates earlier.
+  tick:
+    type: int
+    default: 8
+    description: |
+      Inertia update interval in milliseconds.
+
+  # ── Behaviour ────────────────────────────────────────────
+  axis:
+    type: int
+    default: 0
+    description: |
+      Which axes receive inertia.  0 = both, 1 = Y only, 2 = X only.
+  layer:
+    type: int
+    default: -1
+    description: |
+      Scroll layer index.  When >= 0, inertia stops immediately if this
+      layer becomes inactive.  -1 = no layer check.
+  swap-mod:
+    type: int
+    default: 0
+    description: |
+      Modifier bitmask that, while held, swaps the scroll output axis
+      (vertical ↔ horizontal).  Set 0 to disable.
+
+      Use the MOD_* constants from <dt-bindings/zmk/modifiers.h>:
+        MOD_LCTL=0x01  MOD_LSFT=0x02  MOD_LALT=0x04  MOD_LGUI=0x08
+        MOD_RCTL=0x10  MOD_RSFT=0x20  MOD_RALT=0x40  MOD_RGUI=0x80
+
+      Example: swap-mod = <(MOD_LSFT|MOD_RSFT)>;
+      → either Shift held inverts the scroll axis.
+  unlock-mod:
+    type: int
+    default: 0
+    description: |
+      Modifier bitmask that, while held, unlocks the axis lock and
+      lets the trackball scroll on both axes simultaneously
+      (equivalent to axis=0).  Set 0 to disable.
+
+      Useful when you only have one scroll layer but still want
+      occasional 2D / canvas-pan scrolling — hold this modifier and
+      both axes flow through.
+
+      Takes precedence over swap-mod when both modifiers are held.
+
+      Pick a modifier that doesn't collide with host shortcuts (most
+      apps use Cmd/Ctrl + scroll for zoom).  Right-side modifiers
+      such as MOD_RGUI are usually safe; even safer is to bind the
+      modifier only inside the scroll layer so it only ever fires
+      while you're actively scrolling.

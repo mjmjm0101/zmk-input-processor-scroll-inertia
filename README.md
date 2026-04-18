@@ -204,19 +204,23 @@ A note on units: several properties take values "out of 1000"
 means *multiply velocity by 0.990 each tick*.  This avoids floating-point
 math on the keyboard.
 
-A note on safe ranges: the module assumes sensible values and does not
-fight you if you set unusual ones.  The two values that *would* crash
-or busy-loop are guarded internally — `scale-div = 0` is treated as
-`1`, and `tick = 0` is treated as `1` ms.  Other parameters follow
-GIGO: out-of-range values just produce out-of-range behaviour.
-Recommended ranges:
-- `gain` + `blend` should add to `1000` (otherwise the EMA is
-  unstable: it grows unbounded if the sum exceeds 1000, or under-tracks
-  if it is below).
+**Enforced safety rules** (the module rewrites these silently to keep
+itself running):
+
+- `scale-div = 0` is treated as `1` (would otherwise be division by zero).
+- `tick = 0` is treated as `1` ms (would otherwise busy-loop).
+
+**Recommended ranges** (your responsibility — the module does *not*
+auto-correct these, out-of-range values just produce out-of-range
+behaviour):
+
+- `gain` + `blend` should add to `1000`.  Otherwise the EMA is
+  unstable: it grows unbounded if the sum exceeds 1000, or
+  under-tracks the input if it is below.
 - `decay-fast`, `decay-slow`, `decay-tail` in `[800, 999]`.  Values
-  ≥ 1000 prevent decay (velocity grows or holds forever).
-- `slow` ≤ `fast` (the multi-stage check assumes ascending boundaries;
-  inverting them silently disables the mid stage).
+  ≥ 1000 prevent decay entirely (velocity grows or holds forever).
+- `slow` ≤ `fast`.  The multi-stage check assumes ascending
+  boundaries; inverting them silently skips the mid stage.
 
 | Property | Default | Description |
 |---|---|---|

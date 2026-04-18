@@ -460,8 +460,9 @@ static int scroll_inertia_handle_event(const struct device *dev,
      * arrived for more than a couple of tick intervals, the ball has
      * stopped or the layer was briefly toggled.  Either way, the
      * inertia belongs to a previous interaction and must end. */
+    int32_t tick_ms = safe_tick_ms(cfg->tick_ms);
     if (data->inertia_active && data->last_event_time > 0 &&
-        now - data->last_event_time > safe_tick_ms(cfg->tick_ms) * 2) {
+        now - data->last_event_time > tick_ms * 2) {
         need_reset = true;
     }
 

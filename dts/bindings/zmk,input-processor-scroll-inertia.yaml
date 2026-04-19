@@ -107,18 +107,23 @@ properties:
     default: 0
     description: |
       Constant absolute deceleration subtracted from velocity every
-      tick (scroll units).  0 disables (pure exponential decay).
+      tick, in permille of a scroll unit.  friction=1000 subtracts
+      1 scroll unit per tick; friction=50 subtracts 0.05 per tick.
+      0 disables (pure exponential decay).
 
-      Unlike `decay-*` which is multiplicative and gives every flick
-      the same *relative* tail length, friction is additive: its effect
-      grows as velocity shrinks.  Small flicks feel its bite early and
-      stop sooner; large flicks in their high-velocity phase barely
-      notice it.  This is closer to how iOS composes momentum
-      scrolling (exponential + linear friction).
+      Coulomb (dry) friction model.  Unlike `decay-*` which is
+      multiplicative and gives every flick the same *relative* tail
+      length, friction is additive: its effect grows as velocity
+      shrinks.  Small flicks feel its bite early and stop sooner;
+      large flicks spend most of their run in the high-velocity
+      regime where exponential decay dominates, so they're less
+      affected.
 
-      Typical values: 1–3.  Start low and raise until small flicks
-      stop as quickly as you want; values above ~5 begin to visibly
-      shorten large flicks too.
+      Values below ~4 are lost to fixed-point truncation (internal
+      representation zero) — start from 10 or higher.
+
+      Typical values: 50–200.  Raise until small flicks stop where
+      you want; values above ~500 visibly shorten large flicks too.
 
   stop:
     type: int

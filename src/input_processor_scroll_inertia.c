@@ -108,6 +108,7 @@ struct scroll_inertia_config {
     int32_t decay_slow;
     int32_t slow_fp;
     int32_t decay_tail;
+    int32_t friction_fp;
     int32_t stop_fp;
 
     int32_t scale;
@@ -295,6 +296,15 @@ static void inertia_tick_handler(struct k_work *work) {
                   : av > cfg->slow_fp ? cfg->decay_slow
                   :                     cfg->decay_tail;
         data->vel_y = (int64_t)data->vel_y * d / 1000;
+        /* Additive friction: constant absolute decel per tick.
+         * Grows in relative impact as velocity shrinks, which is
+         * exactly the behaviour wanted for "short small flicks,
+         * untouched big flicks". */
+        if (cfg->friction_fp > 0) {
+            if (data->vel_y > cfg->friction_fp)       data->vel_y -= cfg->friction_fp;
+            else if (data->vel_y < -cfg->friction_fp) data->vel_y += cfg->friction_fp;
+            else                                       data->vel_y = 0;
+        }
     }
     if (ax != AXIS_Y) {
         int32_t av = abs32(data->vel_x);
@@ -302,6 +312,11 @@ static void inertia_tick_handler(struct k_work *work) {
                   : av > cfg->slow_fp ? cfg->decay_slow
                   :                     cfg->decay_tail;
         data->vel_x = (int64_t)data->vel_x * d / 1000;
+        if (cfg->friction_fp > 0) {
+            if (data->vel_x > cfg->friction_fp)       data->vel_x -= cfg->friction_fp;
+            else if (data->vel_x < -cfg->friction_fp) data->vel_x += cfg->friction_fp;
+            else                                       data->vel_x = 0;
+        }
     }
 
     /* Stop gate */
@@ -644,6 +659,7 @@ static struct zmk_input_processor_driver_api scroll_inertia_driver_api = {
         .decay_slow = DT_INST_PROP(n, decay_slow),                            \
         .slow_fp    = DT_INST_PROP(n, slow) << FP_SHIFT,                      \
         .decay_tail = DT_INST_PROP(n, decay_tail),                            \
+        .friction_fp = DT_INST_PROP(n, friction) << FP_SHIFT,                 \
         .stop_fp    = DT_INST_PROP(n, stop) << FP_SHIFT,                      \
         .scale      = DT_INST_PROP(n, scale),                                 \
         .scale_div  = DT_INST_PROP(n, scale_div),                             \

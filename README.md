@@ -234,6 +234,7 @@ behaviour):
 | `decay-slow` | `990` | Mid-speed decay. |
 | `slow` | `0` | Velocity boundary between mid and tail zones.  `0` disables zoning. |
 | `decay-tail` | `990` | Low-speed (tail) decay. |
+| `friction` | `0` | Constant absolute deceleration subtracted from velocity each tick (scroll units).  Additive friction on top of the multiplicative `decay-*`.  Its relative bite grows as velocity shrinks, so small flicks stop noticeably sooner while large flicks in their high-velocity phase barely feel it.  `0` disables (pure exponential).  See note below. |
 | `stop` | `7` | When velocity drops below this, inertia stops.  See note below. |
 | `scale` | `1000` | Output scale numerator. |
 | `scale-div` | `1000` | Output scale denominator.  Each tick adds `velocity × scale / scale-div` to an internal accumulator and emits whole scroll units when it overflows. |
@@ -268,6 +269,32 @@ Counter-intuitively, lowering `stop` makes the tail feel **worse**, not
 better — it lets the velocity fade further, into a region where the
 system has to wait longer and longer between scroll units.  Raise
 `stop` instead and you get a clean cutoff while motion is still smooth.
+
+### About `friction`
+
+`decay-*` is multiplicative (velocity × rate), so every flick has the
+*same relative tail length* — a small flick and a large flick both
+take a similar number of ticks to fade out, just from different
+starting points.  That's why small flicks can feel like they glide a
+bit too long even when big flicks feel right.
+
+`friction` adds a constant absolute deceleration on top.  Because it
+subtracts the same amount regardless of current velocity, its
+relative bite grows as velocity shrinks:
+
+| Phase | Exp decel (at `decay-fast=990`) | Friction `friction=2` | Who dominates |
+|---|---|---|---|
+| Large flick peak (vel=600) | −6/tick (1.0%) | −2/tick (0.3%) | Exponential |
+| Mid (vel=100) | −1/tick (1.0%) | −2/tick (2.0%) | Friction |
+| Tail (vel=20) | −0.2/tick (1.0%) | −2/tick (10.0%) | Friction |
+
+So small flicks hit the friction floor early and stop sooner; large
+flicks spend most of their run in the exponential regime and are
+mostly unaffected.  This composition is closer to iOS's real
+momentum model (exponential + linear).
+
+Start with `friction = 1`, raise until small flicks stop where you
+want.  Values above `~5` begin to visibly shorten large flicks too.
 
 ### About `scale` / `scale-div`
 
@@ -347,6 +374,25 @@ The default `decay-* = 990` gives an iOS-like long, smooth tail.
 
 Try a single curve first.  It usually gets you 90% of the way there
 with one parameter, before you reach for multi-stage.
+
+### Shorten small flicks with `friction`
+
+If large flicks feel right but small flicks still glide a bit too
+long, turn on `friction`.  It's an additive deceleration on top of
+`decay-*`, and because it subtracts a constant amount per tick, its
+relative bite grows as velocity shrinks — exactly what you want for
+"only the short end of the flick range, please".
+
+| Value | Effect |
+|---|---|
+| `0` (default) | Pure exponential — all flicks share the same relative tail length. |
+| `1`–`2` | Small flicks stop noticeably sooner; large flicks essentially unchanged. |
+| `3`–`5` | Stronger bite; the tail of large flicks starts to visibly shorten too. |
+| `> 5` | Usually too aggressive for an iOS-like feel — large flicks begin to feel "dragged". |
+
+Start at `1` and raise in small steps until the smallest deliberate
+flick settles where you want it.  If the free glide of large flicks
+starts to feel dampened, back off one step.
 
 ### Don't extend the tail too far
 

@@ -440,10 +440,13 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
         }
     }
 
-    /* Arming check */
-    bool vel_armed = false;
-    if (ax != AXIS_X) vel_armed |= (abs32(data->peak_vel_y) >= cfg->start_fp);
-    if (ax != AXIS_Y) vel_armed |= (abs32(data->peak_vel_x) >= cfg->start_fp);
+    /* Arming check — uses the vector magnitude of the per-axis peaks
+     * so that a sloppy-angle flick arms at the same overall strength
+     * as an axis-aligned one.  fast_magnitude ≈ sqrt(x²+y²) with a
+     * max ~12% error, plenty accurate for a threshold. */
+    int32_t peak_magnitude = fast_magnitude(data->peak_vel_x,
+                                            data->peak_vel_y);
+    bool vel_armed = (peak_magnitude >= cfg->start_fp);
     bool armed = vel_armed && data->total_movement >= cfg->move
                  && data->tracking_count >= MIN_TRACKING_EVENTS;
 
@@ -533,14 +536,22 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
     return handle_tracked_in_tracking(data, cfg, event);
 }
 
-/* Single-axis cross-axis events never pass through.  They merge into
- * the next tracked-axis event and, during COASTING, count toward the
- * freeze-break threshold. */
+/* Single-axis cross-axis events never pass through downstream.  They
+ * - stash the value in pending_other so the next tracked-axis event
+ *   can magnitude-merge it (preserving the "diagonal = full scroll"
+ *   behaviour the merge was designed for),
+ * - during COASTING, count toward the freeze-break threshold,
+ * - during TRACKING, also update the cross-axis velocity / peak and
+ *   advance tracking_count.  That lets arming use the *vector
+ *   magnitude* of both peaks — so a sloppy-angle flick crosses the
+ *   `start` threshold the same as an axis-aligned flick of the same
+ *   physical strength. */
 static void handle_cross_axis(struct scroll_inertia_data *data,
                               const struct scroll_inertia_config *cfg,
                               struct input_event *event) {
-    int32_t cross_mag = abs32(event->value);
-    data->pending_other = event->value;
+    int32_t raw_value = event->value;
+    int32_t cross_mag = abs32(raw_value);
+    data->pending_other = raw_value;
     event->value = 0;
 
     if (data->state == SS_COASTING) {
@@ -551,10 +562,52 @@ static void handle_cross_axis(struct scroll_inertia_data *data,
              * direct control. */
             to_tracking_from_coasting(data);
         }
-    } else {
+        return;
+    }
+
+    if (data->state == SS_TRACKING) {
+        /* Update cross-axis EMA/peak in parallel with the tracked
+         * axis.  This is identical to the tracked-axis EMA math; the
+         * only difference is that a cross-axis direction reversal
+         * doesn't reset gesture-wide fields (decel_count,
+         * total_movement, tracking_count) — those are tracked-axis
+         * concerns. */
+        int32_t ax = effective_axis(cfg);
+        int32_t *vel_cross  = (ax == AXIS_Y) ? &data->vel_x : &data->vel_y;
+        int32_t *peak_cross = (ax == AXIS_Y) ? &data->peak_vel_x
+                                             : &data->peak_vel_y;
+        int32_t delta_fp = (int32_t)raw_value << FP_SHIFT;
+
+        *vel_cross = ((int64_t)delta_fp * cfg->gain +
+                      (int64_t)(*vel_cross) * cfg->blend) / 1000;
+        *vel_cross = clamp_velocity(*vel_cross, cfg->limit_fp);
+
+        if (*peak_cross != 0 &&
+            (*vel_cross > 0) != (*peak_cross > 0)) {
+            *peak_cross = *vel_cross;
+        } else if (abs32(*vel_cross) > abs32(*peak_cross)) {
+            *peak_cross = *vel_cross;
+        } else {
+            int32_t decayed = (int64_t)(*peak_cross) * PEAK_DECAY / 1000;
+            *peak_cross = abs32(decayed) > abs32(*vel_cross)
+                              ? decayed : *vel_cross;
+        }
+
+        data->tracking_count++;
+        /* NOTE on total_movement: cross-axis magnitude is intentionally
+         * NOT added here.  It already contributes to total_movement
+         * indirectly through the next tracked-axis event's
+         * fast_magnitude merge.  Double-counting would let pure
+         * cross-axis rolling satisfy the move threshold on its own. */
+
         k_work_reschedule(&data->stop_detect_work,
                           K_MSEC(cfg->release_ms));
+        return;
     }
+
+    /* SS_IDLE: keep the stop_detect reschedule so a following tracked
+     * event still sees a live timer.  No tracking yet. */
+    k_work_reschedule(&data->stop_detect_work, K_MSEC(cfg->release_ms));
 }
 
 /* ------------------------------------------------------------------ */
@@ -701,10 +754,10 @@ static void stop_detect_handler(struct k_work *work) {
         return;
     }
 
-    int32_t ax = effective_axis(cfg);
-    bool vel_ok = false;
-    if (ax != AXIS_X) vel_ok |= (abs32(data->vel_y) >= cfg->start_fp);
-    if (ax != AXIS_Y) vel_ok |= (abs32(data->vel_x) >= cfg->start_fp);
+    /* Same vector-magnitude basis as the in-event arming check — see
+     * handle_tracked_in_tracking for the rationale. */
+    int32_t vel_magnitude = fast_magnitude(data->vel_x, data->vel_y);
+    bool vel_ok = (vel_magnitude >= cfg->start_fp);
     bool mov_ok = data->total_movement >= cfg->move;
 
     if (vel_ok && mov_ok && data->tracking_count >= MIN_TRACKING_EVENTS) {

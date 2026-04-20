@@ -226,7 +226,7 @@ behaviour):
 |---|---|---|
 | `gain` | `300` | How strongly each new event pulls the smoothed velocity (out of 1000).  Together with `blend`, this controls a moving average: `velocity = (event * gain + velocity * blend) / 1000`. |
 | `blend` | `700` | How much of the previous velocity is kept (out of 1000).  `gain + blend` should equal 1000. |
-| `start` | `75` | The peak velocity (in raw scroll units) that a flick must reach before inertia is allowed to kick in.  The default is intentionally on the conservative side so that small, deliberate scrolls don't trigger inertia — tune to taste. |
+| `start` | `75` | The peak **vector** velocity (in raw scroll units, `√(peak_x² + peak_y²)`) that a flick must reach before inertia is allowed to kick in.  Angle-invariant: a diagonal flick arms at the same overall strength as an axis-aligned one.  The default is intentionally on the conservative side so that small, deliberate scrolls don't trigger inertia — tune to taste. |
 | `move` | `135` | The total distance the ball must roll within a single flick before inertia is allowed to kick in.  Stops tiny stray motions from triggering it.  Same as `start`, the default is conservative; raise it if even casual scrolls trigger inertia, lower it if real flicks fail to. |
 | `release` | `24` | If no events arrive for this many milliseconds, the ball is treated as released (~3 frames at 125 Hz). |
 | `fast` | `0` | Velocity boundary between the fast and mid decay zones.  `0` disables zoning (single curve). |
@@ -368,8 +368,11 @@ you typically flick.
   only deliberate flicks trigger it.
 - If real flicks aren't triggering: lower them by ~30%.
 
-The two thresholds work independently — `start` filters by speed, `move`
-filters by distance.  Both must be cleared for inertia to start.
+The two thresholds work independently — `start` filters by peak
+**vector** speed (combining both axes), `move` filters by cumulative
+distance.  Both must be cleared for inertia to start.  Because
+`start` operates on the magnitude, sloppy-angle flicks and precise
+flicks hit the same threshold at the same physical strength.
 
 ### Pick a decay rate that matches your style
 
@@ -449,13 +452,17 @@ The processor runs a small three-state machine per instance:
 
 1. **IDLE.**  No gesture in progress.  The first tracked-axis event
    transitions to TRACKING.
-2. **TRACKING.**  Every event updates a smoothed velocity (moving
-   average) and a "peak so far" that slowly drifts down toward the
-   current value when no new high is reached.  Once peak ≥ `start`,
-   total movement ≥ `move`, and at least 10 events have been seen,
-   the gesture is *armed* — if the smoothed velocity then drops below
-   85% of the peak for 3 events in a row, the processor transitions
-   to COASTING.  If no events arrive for `release` ms while armed, a
+2. **TRACKING.**  Every event updates a per-axis smoothed velocity
+   (moving average) and a per-axis "peak so far" that slowly drifts
+   down toward the current value when no new high is reached.  Arming
+   is angle-invariant: it compares the *vector magnitude* of the
+   peaks (`√(peak_x² + peak_y²)`, approximated) against `start`, so a
+   sloppy-angle flick crosses the threshold at the same overall
+   strength as an axis-aligned one.  Once magnitude ≥ `start`, total
+   movement ≥ `move`, and at least 10 events have been seen, the
+   gesture is *armed* — if the smoothed velocity then drops below 85%
+   of the peak for 3 events in a row, the processor transitions to
+   COASTING.  If no events arrive for `release` ms while armed, a
    fallback "stop detect" timer performs the same check for abrupt
    releases.
 3. **COASTING.**  A timer fires every `tick` ms.  Each tick multiplies

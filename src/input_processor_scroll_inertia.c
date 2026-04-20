@@ -55,10 +55,12 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /* Hard safety limit: if this many consecutive events are suppressed
  * (by inertia absorption etc.), force a full state reset.
- * 15 events ≈ 120 ms at 125 Hz — short enough that a user actively
- * rolling the ball past a running inertia regains direct control
- * quickly instead of seeing motion swallowed for ~400 ms. */
-#define SUPPRESS_SAFETY_LIMIT 15
+ * 50 events ≈ 400 ms at 125 Hz.  Kept generous because natural
+ * post-flick physical coasting can fire a few hundred ms of same-
+ * direction events that we want inertia to continue across — the
+ * cross-axis freeze escape route is handled separately, so this
+ * limit only guards truly stuck states. */
+#define SUPPRESS_SAFETY_LIMIT 50
 
 /* Peak velocity decay rate (permille per event).  When the current
  * velocity is below the peak, the peak slowly decays toward it.  This
@@ -540,6 +542,12 @@ static int scroll_inertia_handle_event(const struct device *dev,
             }
             event->value = 0;
             data->suppress_count++;
+            /* Tracked-axis activity proves the user is not just
+             * cross-rolling.  Clear the cross-axis accumulator so
+             * that a diagonal physical coast (Y and X interleaved)
+             * doesn't slowly add up to the move threshold and
+             * cancel inertia prematurely. */
+            data->cross_axis_accumulated = 0;
             return ZMK_INPUT_PROC_CONTINUE;
         }
 

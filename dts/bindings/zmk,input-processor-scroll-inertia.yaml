@@ -233,3 +233,61 @@ properties:
       such as MOD_RGUI are usually safe; even safer is to bind the
       modifier only inside the scroll layer so it only ever fires
       while you're actively scrolling.
+
+  # ── Advanced tuning ──────────────────────────────────────
+  # These knobs expose the internal state-machine timing.  The
+  # defaults are tuned for a 1000 CPI PMW3610 at 125 Hz and cover
+  # typical setups; only adjust if you've characterised a specific
+  # problem on your own hardware.
+  min-events:
+    type: int
+    default: 10
+    description: |
+      Minimum tracked-axis events required before arming is allowed.
+      Gives the EMA time to converge and filters out transient
+      spikes (e.g. a pointer-acceleration processor switching modes).
+      Recommended range [3, 30].  Very low values arm on noise; very
+      high values prevent arming on short but deliberate flicks.
+  decel-samples:
+    type: int
+    default: 3
+    description: |
+      Consecutive sub-peak samples required to confirm deceleration
+      before transitioning TRACKING → COASTING.  Recommended range
+      [1, 10].  1 triggers inertia on any single velocity dip; high
+      values delay the transition and can miss short flicks.
+  decel-ratio:
+    type: int
+    default: 850
+    description: |
+      Deceleration threshold: current magnitude must drop below this
+      permille fraction of the peak magnitude to count as decelerating.
+      850 = 85%.  Recommended range [700, 950].  Higher values trigger
+      on minor steady-state EMA fluctuations; lower values delay inertia
+      activation on gentle releases.
+  peak-decay:
+    type: int
+    default: 990
+    description: |
+      Peak velocity decay rate (permille per event).  When current
+      velocity is below peak, the peak slowly drifts toward it to
+      avoid a brief initial acceleration transient leaving a
+      permanently inflated peak.  Recommended range [950, 999].
+      Values >= 1000 are unsafe: the peak can grow without bound.
+  gesture-timeout:
+    type: int
+    default: 100
+    description: |
+      Milliseconds of silence after which the next event is treated
+      as a brand-new gesture (all tracking state reset).  Prevents
+      stale velocity/peak from a previous session contaminating a
+      new one.  Recommended range [50, 500].
+  suppress-limit:
+    type: int
+    default: 50
+    description: |
+      Hard safety limit: if this many consecutive same-direction
+      events are absorbed in COASTING, force a transition back to
+      TRACKING.  50 events ≈ 400 ms at 125 Hz.  Recommended range
+      [20, 200].  Low values cause needless drop-outs on valid long
+      coasts; high values let stuck states persist longer.

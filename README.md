@@ -251,6 +251,22 @@ behaviour):
 | `swap-mod` | `0` | Bitmask of modifier keys (`MOD_LSFT`, `MOD_RCTL`, etc.) that, while held, swap the output axis (V↔H).  `0` disables. |
 | `unlock-mod` | `0` | Bitmask of modifier keys that, while held, release the axis lock so both axes flow through (free 2D scroll, equivalent to `axis = <0>`).  Takes precedence over `swap-mod`.  `0` disables. |
 
+### Advanced tuning
+
+These knobs expose the internal state-machine timing.  The defaults
+are tuned for a 1000 CPI PMW3610 at 125 Hz and cover typical setups;
+only adjust if you've characterised a specific problem on your own
+hardware.  Out-of-range values will *not* be auto-corrected.
+
+| Property | Default | Recommended range | Description |
+|---|---|---|---|
+| `min-events` | `10` | `[3, 30]` | Minimum tracked-axis events required before arming is allowed.  Lets the EMA converge and filters transient spikes.  Too low arms on noise; too high prevents arming on short but deliberate flicks. |
+| `decel-samples` | `3` | `[1, 10]` | Consecutive sub-peak samples required to confirm deceleration before TRACKING → COASTING.  `1` triggers on any single dip; high values delay the transition. |
+| `decel-ratio` | `850` | `[700, 950]` | Deceleration threshold as permille of peak magnitude.  `850` = current must drop below 85% of peak.  Higher triggers on minor fluctuations; lower delays activation on gentle releases. |
+| `peak-decay` | `990` | `[950, 999]` | Peak velocity decay rate (permille per event).  Lets the peak drift down when velocity is below it, avoiding an inflated peak from a brief initial acceleration transient.  **Values ≥ 1000 are unsafe** — the peak can grow without bound. |
+| `gesture-timeout` | `100` | `[50, 500]` | Milliseconds of silence after which the next event starts a brand-new gesture (all tracking state reset).  Prevents stale velocity/peak from a previous session contaminating a new one. |
+| `suppress-limit` | `50` | `[20, 200]` | Hard safety limit: consecutive same-direction events absorbed in COASTING before forcing a transition back to TRACKING.  `50` ≈ 400 ms at 125 Hz.  Too low causes drop-outs on valid long coasts; too high lets stuck states persist. |
+
 ### About `stop`
 
 How smooth the *very end* of the inertia feels depends not on `stop`
@@ -448,10 +464,10 @@ Transitions in detail:
 | From → To | Trigger |
 |---|---|
 | `IDLE → TRACKING` | First tracked-axis event. |
-| `TRACKING → COASTING` | Peak magnitude ≥ `start`, total movement ≥ `move`, ≥ 10 events, then deceleration confirmed (3 consecutive sub-peak samples).  Or the `stop_detect` fallback fires after `release` ms of silence with the same conditions. |
-| `COASTING → TRACKING` | Reverse-direction event, cross-axis freeze break (cumulative cross-axis motion ≥ `move` while coasting, in single-axis modes), or 50 consecutive same-direction absorbed events (suppress safety). |
+| `TRACKING → COASTING` | Peak magnitude ≥ `start`, total movement ≥ `move`, ≥ `min-events`, then deceleration confirmed (`decel-samples` consecutive sub-peak samples).  Or the `stop_detect` fallback fires after `release` ms of silence with the same conditions. |
+| `COASTING → TRACKING` | Reverse-direction event, cross-axis freeze break (cumulative cross-axis motion ≥ `move` while coasting, in single-axis modes), or `suppress-limit` consecutive same-direction absorbed events (suppress safety). |
 | `COASTING → IDLE` | Velocity < `stop`, `span` exceeded, or the bound layer turns off. |
-| *any* `→ IDLE` | Gesture timeout (no events for 100 ms), or stale-inertia detection (no events for two ticks while COASTING). |
+| *any* `→ IDLE` | Gesture timeout (no events for `gesture-timeout` ms), or stale-inertia detection (no events for two ticks while COASTING). |
 
 ### States
 
@@ -468,12 +484,13 @@ Transitions in detail:
    (`√(peak_x² + peak_y²)`, approximated) rather than per-axis
    values, so a sloppy-angle flick crosses thresholds at the same
    overall strength as an axis-aligned one.  Once magnitude ≥
-   `start`, total movement ≥ `move`, and at least 10 events have
-   been seen, the gesture is *armed* — if the magnitude then drops
-   below 85% of the peak magnitude for 3 events in a row, the
-   processor transitions to COASTING.  If no events arrive for
-   `release` ms while armed, a fallback "stop detect" timer performs
-   the same check for abrupt releases.
+   `start`, total movement ≥ `move`, and at least `min-events`
+   events have been seen, the gesture is *armed* — if the magnitude
+   then drops below `decel-ratio`/1000 of the peak magnitude for
+   `decel-samples` events in a row, the processor transitions to
+   COASTING.  If no events arrive for `release` ms while armed, a
+   fallback "stop detect" timer performs the same check for abrupt
+   releases.
 3. **COASTING.**  On entry the tracked axis's initial velocity is
    boosted to the full vector magnitude of the peak — so a diagonal
    flick coasts at the same strength as an axis-aligned flick of
@@ -492,8 +509,8 @@ Transitions in detail:
 Three timing-based checks can force a transition back to IDLE from
 any state:
 
-- **Gesture timeout** (100 ms with no events).  The next event
-  restarts from a clean slate.
+- **Gesture timeout** (`gesture-timeout` ms with no events).  The next
+  event restarts from a clean slate.
 - **Stale inertia** (coasting but no events for more than two ticks).
   The coast has detached from the physical gesture; end it.
 - **Cross-axis break** (cumulative cross-axis motion exceeding `move`
@@ -503,10 +520,11 @@ any state:
 ### Safety
 
 A `suppress_count` counts consecutive same-direction events absorbed
-during COASTING; after 50 (≈ 400 ms at 125 Hz) the processor drops
-back to TRACKING on the assumption that the user has been rolling
-through a stale coast.  The cross-axis accumulator handles the more
-common freeze vector separately, so this is a genuinely rare fallback.
+during COASTING; after `suppress-limit` (default `50` ≈ 400 ms at
+125 Hz) the processor drops back to TRACKING on the assumption that
+the user has been rolling through a stale coast.  The cross-axis
+accumulator handles the more common freeze vector separately, so this
+is a genuinely rare fallback.
 
 ---
 

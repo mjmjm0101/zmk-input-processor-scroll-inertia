@@ -22,10 +22,10 @@
  * Transitions:
  *   IDLE → TRACKING      first tracked-axis event
  *   TRACKING → COASTING  peak magnitude ≥ start, movement ≥ move,
- *                        ≥ MIN_TRACKING_EVENTS, then deceleration
+ *                        ≥ min-events, then deceleration
  *                        confirmed (or stop_detect fallback)
  *   COASTING → TRACKING  reverse direction, cross-axis break, or
- *                        SUPPRESS_SAFETY_LIMIT same-dir absorbs
+ *                        suppress-limit same-dir absorbs
  *   COASTING → IDLE      vel < stop, span exceeded, layer off
  *   any → IDLE           gesture timeout, or stale inertia
  *                        (see should_reset_on_timeout)
@@ -62,40 +62,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define AXIS_Y    1
 #define AXIS_X    2
 
-/* Consecutive sub-peak samples required to confirm deceleration */
-#define DECEL_CONFIRM_COUNT  3
-
-/* If no event arrives for this many ms, the next event is treated as
- * the start of a brand-new gesture and all tracking state is reset.
- * This prevents stale velocity / peak from a previous scroll session
- * (or layer) from contaminating a new one. */
-#define GESTURE_TIMEOUT_MS   100
-
-/* EMA must drop below this fraction of peak to count as deceleration.
- * 850 / 1000 = 85%.  Prevents minor EMA fluctuations during steady
- * scrolling from falsely triggering inertia. */
-#define DECEL_PEAK_RATIO     850
-
-/* Hard safety limit: if this many consecutive events are suppressed
- * by same-direction absorption in COASTING, force a transition back
- * to TRACKING.  50 events ≈ 400 ms at 125 Hz — long enough to cover
- * normal post-flick physical coasting, short enough to recover from
- * a genuinely stuck state.  The cross-axis freeze escape route is
- * handled by cross_axis_accumulated separately. */
-#define SUPPRESS_SAFETY_LIMIT 50
-
-/* Peak velocity decay rate (permille per event).  When the current
- * velocity is below the peak, the peak slowly decays toward it.  This
- * prevents a brief initial acceleration transient from leaving a
- * permanently inflated peak that makes steady-state scrolling look
- * like deceleration. */
-#define PEAK_DECAY           990
-
-/* Minimum events after a reset before arming is allowed.  Gives the
- * EMA time to converge and filters out transient spikes from shared
- * upstream modules (e.g. a pointer-acceleration processor switching
- * from cursor mode to scroll mode). */
-#define MIN_TRACKING_EVENTS  10
+/* Advanced-tuning constants are exposed as Devicetree properties
+ * (decel-samples, gesture-timeout, decel-ratio, suppress-limit,
+ * peak-decay, min-events).  Read via cfg-> throughout this file;
+ * see dts/bindings/...yaml for defaults and recommended ranges. */
 
 /* ------------------------------------------------------------------
  * Concurrency model
@@ -165,6 +135,14 @@ struct scroll_inertia_config {
     int32_t layer;
     int32_t swap_mod;
     int32_t unlock_mod;     /* modifier bitmask that frees both axes */
+
+    /* Advanced tuning (see YAML binding for descriptions) */
+    int32_t min_events;
+    int32_t decel_samples;
+    int32_t decel_ratio;
+    int32_t peak_decay;
+    int32_t gesture_timeout_ms;
+    int32_t suppress_limit;
 };
 
 /* ------------------------------------------------------------------ */
@@ -218,7 +196,7 @@ struct scroll_inertia_data {
     int64_t inertia_start_time;
 
     /* Consecutive same-direction events absorbed in COASTING.  Reset
-     * on any cross-axis or state change.  Hitting SUPPRESS_SAFETY_LIMIT
+     * on any cross-axis or state change.  Hitting suppress-limit
      * transitions back to TRACKING on the assumption that the user
      * has been actively rolling past a stale coast. */
     int32_t suppress_count;
@@ -445,7 +423,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
         } else if (abs32(data->vel_y) > abs32(data->peak_vel_y)) {
             data->peak_vel_y = data->vel_y;
         } else {
-            int32_t decayed = (int64_t)data->peak_vel_y * PEAK_DECAY / 1000;
+            int32_t decayed = (int64_t)data->peak_vel_y * cfg->peak_decay / 1000;
             data->peak_vel_y = abs32(decayed) > abs32(data->vel_y)
                                    ? decayed : data->vel_y;
         }
@@ -466,7 +444,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
         } else if (abs32(data->vel_x) > abs32(data->peak_vel_x)) {
             data->peak_vel_x = data->vel_x;
         } else {
-            int32_t decayed = (int64_t)data->peak_vel_x * PEAK_DECAY / 1000;
+            int32_t decayed = (int64_t)data->peak_vel_x * cfg->peak_decay / 1000;
             data->peak_vel_x = abs32(decayed) > abs32(data->vel_x)
                                    ? decayed : data->vel_x;
         }
@@ -480,7 +458,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
                                             data->peak_vel_y);
     bool vel_armed = (peak_magnitude >= cfg->start_fp);
     bool armed = vel_armed && data->total_movement >= cfg->move
-                 && data->tracking_count >= MIN_TRACKING_EVENTS;
+                 && data->tracking_count >= cfg->min_events;
 
     /* Deceleration detection — magnitude-based for angle invariance.
      * A flick slowing down in X but steady in Y (or vice versa) is
@@ -490,7 +468,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
         int32_t cur_magnitude = fast_magnitude(data->vel_x, data->vel_y);
         bool decelerating = false;
         if (cur_magnitude <
-                (int64_t)peak_magnitude * DECEL_PEAK_RATIO / 1000) {
+                (int64_t)peak_magnitude * cfg->decel_ratio / 1000) {
             /* Direction guard: the event's own axis peak must share
              * sign with the event.  During a reversal the EMA on
              * that axis lags and the overall magnitude can dip for a
@@ -504,7 +482,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
 
         if (decelerating) {
             data->decel_count++;
-            if (data->decel_count >= DECEL_CONFIRM_COUNT) {
+            if (data->decel_count >= cfg->decel_samples) {
                 to_coasting(data, cfg);
                 event->value = 0;
                 return false;
@@ -555,7 +533,7 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
          * threshold through accumulated X alone. */
         data->cross_axis_accumulated = 0;
 
-        if (data->suppress_count >= SUPPRESS_SAFETY_LIMIT) {
+        if (data->suppress_count >= cfg->suppress_limit) {
             /* Long same-direction absorption — user has been actively
              * rolling past a stale coast.  Drop back to TRACKING and
              * let the current event flow. */
@@ -628,7 +606,7 @@ static void handle_cross_axis(struct scroll_inertia_data *data,
         } else if (abs32(*vel_cross) > abs32(*peak_cross)) {
             *peak_cross = *vel_cross;
         } else {
-            int32_t decayed = (int64_t)(*peak_cross) * PEAK_DECAY / 1000;
+            int32_t decayed = (int64_t)(*peak_cross) * cfg->peak_decay / 1000;
             *peak_cross = abs32(decayed) > abs32(*vel_cross)
                               ? decayed : *vel_cross;
         }
@@ -660,7 +638,7 @@ static bool should_reset_on_timeout(struct scroll_inertia_data *data,
     /* Gesture timeout: long silence means the next event is a brand
      * new gesture.  Applies in any state. */
     if (data->last_event_time > 0 &&
-        now - data->last_event_time > GESTURE_TIMEOUT_MS) {
+        now - data->last_event_time > cfg->gesture_timeout_ms) {
         return true;
     }
 
@@ -800,7 +778,7 @@ static void stop_detect_handler(struct k_work *work) {
     bool vel_ok = (vel_magnitude >= cfg->start_fp);
     bool mov_ok = data->total_movement >= cfg->move;
 
-    if (vel_ok && mov_ok && data->tracking_count >= MIN_TRACKING_EVENTS) {
+    if (vel_ok && mov_ok && data->tracking_count >= cfg->min_events) {
         to_coasting(data, cfg);
     } else {
         to_idle(data);
@@ -939,6 +917,12 @@ static struct zmk_input_processor_driver_api scroll_inertia_driver_api = {
         .layer      = DT_INST_PROP(n, layer),                                  \
         .swap_mod   = DT_INST_PROP(n, swap_mod),                              \
         .unlock_mod = DT_INST_PROP(n, unlock_mod),                            \
+        .min_events         = DT_INST_PROP(n, min_events),                    \
+        .decel_samples      = DT_INST_PROP(n, decel_samples),                 \
+        .decel_ratio        = DT_INST_PROP(n, decel_ratio),                   \
+        .peak_decay         = DT_INST_PROP(n, peak_decay),                    \
+        .gesture_timeout_ms = DT_INST_PROP(n, gesture_timeout),               \
+        .suppress_limit     = DT_INST_PROP(n, suppress_limit),                \
     };                                                                        \
     DEVICE_DT_INST_DEFINE(n, scroll_inertia_init, NULL,                       \
                           &scroll_inertia_data_##n,                           \

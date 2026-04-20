@@ -17,23 +17,18 @@
  * ------------
  * Each instance is modelled as an explicit 3-state machine:
  *
- *                              IDLE
- *                                │
- *                                │ first tracked event
- *                                ▼
- *       ┌─(reverse / cross break / suppress)──┐
- *       │                                      │
- *       ▼                                      │
- *   TRACKING ─(arming + decel, or stop_detect)──▶ COASTING
- *       │                                        │
- *       │    (vel<stop / span / layer-off)       │
- *       └────────────────────────────────────────┘
- *                    ▼
- *                   IDLE
+ *     IDLE  ──▶  TRACKING  ──▶  COASTING  ──▶  IDLE
  *
- * A gesture timeout (no events for GESTURE_TIMEOUT_MS) and the
- * stale-inertia check (no events for two ticks while COASTING) can
- * also force any state back to IDLE — see should_reset_on_timeout().
+ * Transitions:
+ *   IDLE → TRACKING      first tracked-axis event
+ *   TRACKING → COASTING  peak magnitude ≥ start, movement ≥ move,
+ *                        ≥ MIN_TRACKING_EVENTS, then deceleration
+ *                        confirmed (or stop_detect fallback)
+ *   COASTING → TRACKING  reverse direction, cross-axis break, or
+ *                        SUPPRESS_SAFETY_LIMIT same-dir absorbs
+ *   COASTING → IDLE      vel < stop, span exceeded, layer off
+ *   any → IDLE           gesture timeout, or stale inertia
+ *                        (see should_reset_on_timeout)
  *
  * Only one state is active at a time.  Every event is classified
  * (untracked / cross-axis / tracked-axis), then dispatched to the

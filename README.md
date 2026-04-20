@@ -437,20 +437,18 @@ between active scroll and inertia feel more in sync.
 The processor runs a small three-state machine per instance:
 
 ```
-        ┌─── gesture timeout / stop_detect fail ───┐
-        │                                          ▼
-        │                                        IDLE
-        │                                          │ first tracked event
-        │                                          ▼
-        │       ┌── reverse / cross-axis break ──┐
-        │       │                                 │
-        │       ▼                                 │
-    TRACKING ──(arming + decel confirmed)────▶ COASTING
-        ▲                                          │
-        │                                          │ vel < stop,
-        └───────── (via IDLE) ─────────────────────┘ span exceeded,
-                                                     layer off
+    IDLE  ──▶  TRACKING  ──▶  COASTING  ──▶  IDLE
 ```
+
+Transitions in detail:
+
+| From → To | Trigger |
+|---|---|
+| `IDLE → TRACKING` | First tracked-axis event. |
+| `TRACKING → COASTING` | Peak magnitude ≥ `start`, total movement ≥ `move`, ≥ 10 events, then deceleration confirmed (3 consecutive sub-peak samples).  Or the `stop_detect` fallback fires after `release` ms of silence with the same conditions. |
+| `COASTING → TRACKING` | Reverse-direction event, cross-axis freeze break (cumulative cross-axis motion ≥ `move` while coasting, in single-axis modes), or 50 consecutive same-direction absorbed events (suppress safety). |
+| `COASTING → IDLE` | Velocity < `stop`, `span` exceeded, or the bound layer turns off. |
+| *any* `→ IDLE` | Gesture timeout (no events for 100 ms), or stale-inertia detection (no events for two ticks while COASTING). |
 
 ### States
 

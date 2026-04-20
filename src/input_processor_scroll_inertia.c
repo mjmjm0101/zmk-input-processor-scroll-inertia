@@ -55,8 +55,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /* Hard safety limit: if this many consecutive events are suppressed
  * (by inertia absorption etc.), force a full state reset.
- * 50 events ≈ 400 ms at 125 Hz. */
-#define SUPPRESS_SAFETY_LIMIT 50
+ * 15 events ≈ 120 ms at 125 Hz — short enough that a user actively
+ * rolling the ball past a running inertia regains direct control
+ * quickly instead of seeing motion swallowed for ~400 ms. */
+#define SUPPRESS_SAFETY_LIMIT 15
 
 /* Peak velocity decay rate (permille per event).  When the current
  * velocity is below the peak, the peak slowly decays toward it.  This
@@ -156,6 +158,14 @@ struct scroll_inertia_data {
      * rather than carrying a queue. */
     int32_t pending_other;
 
+    /* Cumulative |delta| of cross-axis input seen while inertia is
+     * active.  In single-axis modes, cross-axis events early-return
+     * with value zeroed; if the user is vigorously rolling in the
+     * untracked axis, this counter grows.  When it exceeds `move`,
+     * inertia is cancelled so the user regains direct control
+     * instead of seeing the ball's motion silently swallowed. */
+    int32_t cross_axis_accumulated;
+
     /* Sub-unit scroll accumulators */
     int32_t accum_x;
     int32_t accum_y;
@@ -233,6 +243,7 @@ static void reset_state(struct scroll_inertia_data *data) {
     data->tracking_count = 0;
     data->suppress_count = 0;
     data->pending_other = 0;
+    data->cross_axis_accumulated = 0;
 }
 
 static void cancel_inertia(struct scroll_inertia_data *data) {
@@ -250,6 +261,7 @@ static void start_inertia(struct scroll_inertia_data *data,
     data->start_movement = data->total_movement;
     data->accum_x = 0;
     data->accum_y = 0;
+    data->cross_axis_accumulated = 0;
     k_work_cancel_delayable(&data->stop_detect_work);
 
     LOG_DBG("Inertia start  vel_y=%d vel_x=%d  mov=%d",
@@ -426,9 +438,18 @@ static int scroll_inertia_handle_event(const struct device *dev,
      * AXIS_BOTH and both axes flow through independently). */
     if (ax == AXIS_Y && is_x) {
         data->pending_other = event->value;
+        int32_t cross_mag = abs32(event->value);
         event->value = 0;
         data->last_event_time = k_uptime_get();
-        if (!data->inertia_active) {
+        if (data->inertia_active) {
+            /* Vigorous cross-axis rolling means the user wants
+             * direct control back — silently swallowing their motion
+             * is the freeze symptom this guards against. */
+            data->cross_axis_accumulated += cross_mag;
+            if (data->cross_axis_accumulated >= cfg->move) {
+                cancel_inertia(data);
+            }
+        } else {
             k_work_reschedule(&data->stop_detect_work,
                               K_MSEC(cfg->release_ms));
         }
@@ -436,9 +457,15 @@ static int scroll_inertia_handle_event(const struct device *dev,
     }
     if (ax == AXIS_X && is_y) {
         data->pending_other = event->value;
+        int32_t cross_mag = abs32(event->value);
         event->value = 0;
         data->last_event_time = k_uptime_get();
-        if (!data->inertia_active) {
+        if (data->inertia_active) {
+            data->cross_axis_accumulated += cross_mag;
+            if (data->cross_axis_accumulated >= cfg->move) {
+                cancel_inertia(data);
+            }
+        } else {
             k_work_reschedule(&data->stop_detect_work,
                               K_MSEC(cfg->release_ms));
         }

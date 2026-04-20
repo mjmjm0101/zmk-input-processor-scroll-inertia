@@ -234,7 +234,7 @@ behaviour):
 | `decay-slow` | `990` | Mid-speed decay. |
 | `slow` | `0` | Velocity boundary between mid and tail zones.  `0` disables zoning. |
 | `decay-tail` | `990` | Low-speed (tail) decay. |
-| `friction` | `0` | Constant absolute deceleration subtracted from velocity each tick, **in permille of a scroll unit** (`friction=1000` = 1 unit/tick).  Additive (Coulomb) friction on top of the multiplicative `decay-*`.  Its relative bite grows as velocity shrinks, so small flicks stop noticeably sooner while large flicks in their high-velocity phase are less affected.  `0` disables (pure exponential).  See note below. |
+| `friction` | `35` | Constant absolute deceleration subtracted from velocity each tick, **in permille of a scroll unit** (`friction=1000` = 1 unit/tick).  Additive (Coulomb) friction on top of the multiplicative `decay-*`.  Its relative bite grows as velocity shrinks, so small flicks stop noticeably sooner while large flicks in their high-velocity phase are less affected.  `0` disables (pure exponential).  See note below. |
 | `stop` | `7` | When velocity drops below this, inertia stops.  See note below. |
 | `scale` | `1000` | Output scale numerator. |
 | `scale-div` | `1000` | Output scale denominator.  Each tick adds `velocity × scale / scale-div` to an internal accumulator and emits whole scroll units when it overflows. |

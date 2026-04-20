@@ -109,7 +109,7 @@ properties:
       Higher value produces a longer, gentler fade-out.
   friction:
     type: int
-    default: 0
+    default: 35
     description: |
       Constant absolute deceleration subtracted from velocity every
       tick, in permille of a scroll unit.  friction=1000 subtracts

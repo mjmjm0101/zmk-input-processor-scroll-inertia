@@ -427,25 +427,66 @@ between active scroll and inertia feel more in sync.
 
 ## How it works
 
-1. **Tracking.**  Every event updates a smoothed velocity (a moving
-   average) and a "peak so far" that slowly drifts down toward the
-   current value when no new high is reached.
-2. **Arming.**  Once peak ≥ `start`, total movement ≥ `move`, and at
-   least 10 events have been seen, the gesture is "armed" — meaning
-   inertia is allowed to take over.
-3. **Deceleration detection.**  While armed, if the smoothed velocity
-   drops below 85% of the peak for 3 events in a row (and the event
-   direction matches the peak direction), inertia takes over.
-4. **Inertia.**  A timer fires every `tick` ms.  Each tick multiplies
-   velocity by the configured decay, accumulates the result, and sends
-   any whole scroll units to the host.  Real events that arrive in
-   the same direction get absorbed; events in the opposite direction
-   cancel inertia.
-5. **Stopping.**  Inertia ends when velocity drops below `stop`, when
-   the layer turns off, or when the `span` safety cap is reached.
+The processor runs a small three-state machine per instance:
 
-There's also a fallback "stop detect" timer for the case where the ball
-goes from full speed to zero with no gradual slowdown to detect.
+```
+        ┌─── gesture timeout / stop_detect fail ───┐
+        │                                          ▼
+        │                                        IDLE
+        │                                          │ first tracked event
+        │                                          ▼
+        │       ┌── reverse / cross-axis break ──┐
+        │       │                                 │
+        │       ▼                                 │
+    TRACKING ──(arming + decel confirmed)────▶ COASTING
+        ▲                                          │
+        │                                          │ vel < stop,
+        └───────── (via IDLE) ─────────────────────┘ span exceeded,
+                                                     layer off
+```
+
+### States
+
+1. **IDLE.**  No gesture in progress.  The first tracked-axis event
+   transitions to TRACKING.
+2. **TRACKING.**  Every event updates a smoothed velocity (moving
+   average) and a "peak so far" that slowly drifts down toward the
+   current value when no new high is reached.  Once peak ≥ `start`,
+   total movement ≥ `move`, and at least 10 events have been seen,
+   the gesture is *armed* — if the smoothed velocity then drops below
+   85% of the peak for 3 events in a row, the processor transitions
+   to COASTING.  If no events arrive for `release` ms while armed, a
+   fallback "stop detect" timer performs the same check for abrupt
+   releases.
+3. **COASTING.**  A timer fires every `tick` ms.  Each tick multiplies
+   velocity by the configured decay, subtracts friction, accumulates,
+   and emits whole scroll units to the host.  Tracking-axis events
+   that arrive in the same direction are absorbed (possibly bumping
+   velocity to match the ball's actual motion); opposite-direction
+   events cancel inertia back to TRACKING.  Coasting ends when
+   velocity drops below `stop`, when the layer turns off, or when the
+   `span` safety cap is reached.
+
+### Implicit resets
+
+Three timing-based checks can force a transition back to IDLE from
+any state:
+
+- **Gesture timeout** (100 ms with no events).  The next event
+  restarts from a clean slate.
+- **Stale inertia** (coasting but no events for more than two ticks).
+  The coast has detached from the physical gesture; end it.
+- **Cross-axis break** (cumulative cross-axis motion exceeding `move`
+  during coasting, in single-axis mode).  The user is actively
+  rolling the untracked axis — give them direct control.
+
+### Safety
+
+A `suppress_count` counts consecutive same-direction events absorbed
+during COASTING; after 50 (≈ 400 ms at 125 Hz) the processor drops
+back to TRACKING on the assumption that the user has been rolling
+through a stale coast.  The cross-axis accumulator handles the more
+common freeze vector separately, so this is a genuinely rare fallback.
 
 ---
 

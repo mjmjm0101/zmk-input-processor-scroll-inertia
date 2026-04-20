@@ -13,6 +13,33 @@
  * input_listener scroller block bound to its own layer.  See README.md
  * for the rationale and recommended placement.
  *
+ * Architecture
+ * ------------
+ * Each instance is modelled as an explicit 3-state machine:
+ *
+ *       ┌─── gesture timeout / stop_detect fail ───┐
+ *       │                                          ▼
+ *       │                                        IDLE
+ *       │                                          │
+ *       │                                          │ first tracked event
+ *       │                                          ▼
+ *       │        ┌─(reverse / cross break / suppress)──┐
+ *       │        │                                      │
+ *       │        ▼                                      │
+ *   TRACKING ─(arming + decel confirmed)──────────▶ COASTING
+ *       ▲                                               │
+ *       │                                               │ vel<stop,
+ *       │                                               │ span,
+ *       │                                               │ layer-off
+ *       │                                               ▼
+ *       └───── (via IDLE) ───────────────────────────▶ IDLE
+ *
+ * Only one state is active at a time.  Every event is classified
+ * (NOP / cross-axis / tracked-axis), then dispatched to the current
+ * state's handler.  State transitions are explicit function calls
+ * (to_idle / to_tracking_from_* / to_coasting) so the code can be
+ * audited by grepping for them.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -54,12 +81,11 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define DECEL_PEAK_RATIO     850
 
 /* Hard safety limit: if this many consecutive events are suppressed
- * (by inertia absorption etc.), force a full state reset.
- * 50 events ≈ 400 ms at 125 Hz.  Kept generous because natural
- * post-flick physical coasting can fire a few hundred ms of same-
- * direction events that we want inertia to continue across — the
- * cross-axis freeze escape route is handled separately, so this
- * limit only guards truly stuck states. */
+ * by same-direction absorption in COASTING, force a transition back
+ * to TRACKING.  50 events ≈ 400 ms at 125 Hz — long enough to cover
+ * normal post-flick physical coasting, short enough to recover from
+ * a genuinely stuck state.  The cross-axis freeze escape route is
+ * handled by cross_axis_accumulated separately. */
 #define SUPPRESS_SAFETY_LIMIT 50
 
 /* Peak velocity decay rate (permille per event).  When the current
@@ -94,6 +120,22 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * working from a value that's one update old.  We deliberately keep
  * the implementation lock-free for simplicity and predictability.
  * ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* State machine                                                       */
+/* ------------------------------------------------------------------ */
+
+enum scroll_state {
+    SS_IDLE,        /* no gesture active                         */
+    SS_TRACKING,    /* building velocity / peak for arming       */
+    SS_COASTING,    /* inertia tick is emitting decaying scroll  */
+};
+
+enum event_class {
+    EC_UNTRACKED,   /* not a scroll event, or zero value — ignore */
+    EC_CROSS_AXIS,  /* single-axis mode, event is on the other axis */
+    EC_TRACKED,     /* scroll event on the tracked axis, non-zero */
+};
 
 /* ------------------------------------------------------------------ */
 /* Configuration (read from Devicetree at compile time)                */
@@ -134,7 +176,12 @@ struct scroll_inertia_config {
 struct scroll_inertia_data {
     const struct device *dev;
 
-    /* Velocity EMA in fixed-point (×256) */
+    enum scroll_state state;
+
+    /* --- TRACKING fields --- */
+
+    /* Velocity EMA in fixed-point (×256).  Also used in COASTING as
+     * the decaying velocity; re-initialised when TRACKING starts. */
     int32_t vel_x;
     int32_t vel_y;
 
@@ -160,28 +207,35 @@ struct scroll_inertia_data {
      * rather than carrying a queue. */
     int32_t pending_other;
 
-    /* Cumulative |delta| of cross-axis input seen while inertia is
-     * active.  In single-axis modes, cross-axis events early-return
-     * with value zeroed; if the user is vigorously rolling in the
-     * untracked axis, this counter grows.  When it exceeds `move`,
-     * inertia is cancelled so the user regains direct control
-     * instead of seeing the ball's motion silently swallowed. */
-    int32_t cross_axis_accumulated;
+    /* --- COASTING fields --- */
 
     /* Sub-unit scroll accumulators */
     int32_t accum_x;
     int32_t accum_y;
 
-    /* Inertia state */
-    bool inertia_active;
     int64_t inertia_start_time;
     int32_t start_movement;
 
+    /* Consecutive same-direction events absorbed in COASTING.  Reset
+     * on any cross-axis or state change.  Hitting SUPPRESS_SAFETY_LIMIT
+     * transitions back to TRACKING on the assumption that the user
+     * has been actively rolling past a stale coast. */
+    int32_t suppress_count;
+
+    /* Cumulative |delta| of cross-axis input seen while in COASTING.
+     * In single-axis modes, cross-axis events early-return with their
+     * value zeroed; if the user is vigorously rolling the non-tracked
+     * axis, this counter grows.  When it exceeds `move`, inertia is
+     * cancelled so the user regains direct control.  Cleared whenever
+     * a tracked-axis event is absorbed, so diagonal post-flick coasts
+     * (interleaved tracked/cross events) don't accidentally trigger
+     * the break. */
+    int32_t cross_axis_accumulated;
+
+    /* --- Global timing --- */
+
     /* Timestamp of the last event (for gesture-timeout detection) */
     int64_t last_event_time;
-
-    /* Consecutive suppressed events (safety net) */
-    int32_t suppress_count;
 
     /* Delayed work items */
     struct k_work_delayable stop_detect_work;
@@ -235,7 +289,15 @@ static inline int32_t clamp_velocity(int32_t vel, int32_t limit_fp) {
 static inline int32_t safe_scale_div(int32_t v) { return v > 0 ? v : 1; }
 static inline int32_t safe_tick_ms(int32_t v)   { return v > 0 ? v : 1; }
 
-static void reset_state(struct scroll_inertia_data *data) {
+/* ------------------------------------------------------------------ */
+/* State transitions                                                   */
+/* ------------------------------------------------------------------
+ * These are the only functions that assign to data->state.  All other
+ * code goes through them.  Each transition knows exactly which fields
+ * to clear for the destination state; callers don't need to remember.
+ * ------------------------------------------------------------------ */
+
+static void clear_tracking_fields(struct scroll_inertia_data *data) {
     data->vel_x = 0;
     data->vel_y = 0;
     data->peak_vel_x = 0;
@@ -243,324 +305,90 @@ static void reset_state(struct scroll_inertia_data *data) {
     data->total_movement = 0;
     data->decel_count = 0;
     data->tracking_count = 0;
-    data->suppress_count = 0;
     data->pending_other = 0;
+}
+
+static void clear_coasting_fields(struct scroll_inertia_data *data) {
+    data->accum_x = 0;
+    data->accum_y = 0;
+    data->suppress_count = 0;
     data->cross_axis_accumulated = 0;
 }
 
-static void cancel_inertia(struct scroll_inertia_data *data) {
-    data->inertia_active = false;
-    k_work_cancel_delayable(&data->inertia_tick_work);
-    data->accum_x = 0;
-    data->accum_y = 0;
-    reset_state(data);
+static void to_idle(struct scroll_inertia_data *data) {
+    if (data->state == SS_COASTING) {
+        k_work_cancel_delayable(&data->inertia_tick_work);
+    }
+    k_work_cancel_delayable(&data->stop_detect_work);
+    clear_tracking_fields(data);
+    clear_coasting_fields(data);
+    data->state = SS_IDLE;
 }
 
-static void start_inertia(struct scroll_inertia_data *data,
-                          const struct scroll_inertia_config *cfg) {
-    data->inertia_active = true;
+static void to_tracking_from_idle(struct scroll_inertia_data *data) {
+    /* IDLE already has tracking fields cleared, but clear again to be
+     * safe — cheap, and defends against a stray IDLE entry where only
+     * part of the state was reset. */
+    clear_tracking_fields(data);
+    data->state = SS_TRACKING;
+}
+
+static void to_tracking_from_coasting(struct scroll_inertia_data *data) {
+    k_work_cancel_delayable(&data->inertia_tick_work);
+    clear_coasting_fields(data);
+    clear_tracking_fields(data);
+    data->state = SS_TRACKING;
+}
+
+static void to_coasting(struct scroll_inertia_data *data,
+                       const struct scroll_inertia_config *cfg) {
+    /* Velocity is inherited from TRACKING — that's the whole point.
+     * Only clear coasting-specific fields and schedule the tick. */
+    clear_coasting_fields(data);
     data->inertia_start_time = k_uptime_get();
     data->start_movement = data->total_movement;
-    data->accum_x = 0;
-    data->accum_y = 0;
-    data->cross_axis_accumulated = 0;
     k_work_cancel_delayable(&data->stop_detect_work);
+    data->state = SS_COASTING;
 
     LOG_DBG("Inertia start  vel_y=%d vel_x=%d  mov=%d",
             data->vel_y, data->vel_x, data->total_movement);
 
-    k_work_schedule(&data->inertia_tick_work, K_MSEC(safe_tick_ms(cfg->tick_ms)));
+    k_work_schedule(&data->inertia_tick_work,
+                    K_MSEC(safe_tick_ms(cfg->tick_ms)));
 }
 
 /* ------------------------------------------------------------------ */
-/* Inertia tick                                                        */
+/* Event classification                                                */
 /* ------------------------------------------------------------------ */
 
-static void inertia_tick_handler(struct k_work *work) {
-    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-    struct scroll_inertia_data *data =
-        CONTAINER_OF(dwork, struct scroll_inertia_data, inertia_tick_work);
-    const struct scroll_inertia_config *cfg = data->dev->config;
-
-    if (!data->inertia_active) {
-        return;
-    }
-
-    /* Layer gate */
-    if (cfg->layer >= 0 && !zmk_keymap_layer_active(cfg->layer)) {
-        cancel_inertia(data);
-        return;
-    }
-
-    /* Duration gate (safety cap only — the natural exponential decay
-     * already gives lighter flicks shorter inertia because lower
-     * initial velocity reaches the stop threshold sooner). */
-    if (k_uptime_get() - data->inertia_start_time > cfg->span_ms) {
-        cancel_inertia(data);
-        return;
-    }
-
-    int32_t ax = effective_axis(cfg);
-
-    /* Three-stage decay.  Set fast=0 and slow=0 with all three rates
-     * equal for a single-curve (iOS-style) decay. */
-    if (ax != AXIS_X) {
-        int32_t av = abs32(data->vel_y);
-        int32_t d = av > cfg->fast_fp ? cfg->decay_fast
-                  : av > cfg->slow_fp ? cfg->decay_slow
-                  :                     cfg->decay_tail;
-        data->vel_y = (int64_t)data->vel_y * d / 1000;
-        /* Additive (Coulomb) friction: constant absolute decel per
-         * tick.  Configured in permille of scroll units — friction=1000
-         * means 1 scroll unit subtracted per tick.  Grows in relative
-         * impact as velocity shrinks, which is the whole point. */
-        if (cfg->friction_fp > 0) {
-            if (data->vel_y > cfg->friction_fp)       data->vel_y -= cfg->friction_fp;
-            else if (data->vel_y < -cfg->friction_fp) data->vel_y += cfg->friction_fp;
-            else                                       data->vel_y = 0;
-        }
-    }
-    if (ax != AXIS_Y) {
-        int32_t av = abs32(data->vel_x);
-        int32_t d = av > cfg->fast_fp ? cfg->decay_fast
-                  : av > cfg->slow_fp ? cfg->decay_slow
-                  :                     cfg->decay_tail;
-        data->vel_x = (int64_t)data->vel_x * d / 1000;
-        if (cfg->friction_fp > 0) {
-            if (data->vel_x > cfg->friction_fp)       data->vel_x -= cfg->friction_fp;
-            else if (data->vel_x < -cfg->friction_fp) data->vel_x += cfg->friction_fp;
-            else                                       data->vel_x = 0;
-        }
-    }
-
-    /* Stop gate */
-    bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;
-    bool below_x = (ax == AXIS_Y) || abs32(data->vel_x) < cfg->stop_fp;
-    if (below_y && below_x) {
-        cancel_inertia(data);
-        return;
-    }
-
-    /* Accumulate sub-unit values and emit integer scroll deltas */
-    int16_t emit_x = 0, emit_y = 0;
-
-    int32_t sdiv = safe_scale_div(cfg->scale_div);
-    if (ax != AXIS_X) {
-        data->accum_y += (int64_t)data->vel_y * cfg->scale / sdiv;
-        emit_y = (int16_t)(data->accum_y >> FP_SHIFT);
-        data->accum_y -= (int32_t)emit_y << FP_SHIFT;
-    }
-    if (ax != AXIS_Y) {
-        data->accum_x += (int64_t)data->vel_x * cfg->scale / sdiv;
-        emit_x = (int16_t)(data->accum_x >> FP_SHIFT);
-        data->accum_x -= (int32_t)emit_x << FP_SHIFT;
-    }
-
-    if (emit_x != 0 || emit_y != 0) {
-        int16_t out_x = emit_x;
-        int16_t out_y = emit_y;
-        /* swap-mod has no effect when unlock-mod is freeing both axes */
-        if (ax != AXIS_BOTH && swap_active(cfg)) {
-            out_x = emit_y;
-            out_y = emit_x;
-        }
-        zmk_hid_mouse_movement_set(0, 0);
-        zmk_hid_mouse_scroll_set(out_x, out_y);
-        zmk_endpoints_send_mouse_report();
-        zmk_hid_mouse_scroll_set(0, 0);
-    }
-
-    k_work_schedule(&data->inertia_tick_work, K_MSEC(safe_tick_ms(cfg->tick_ms)));
-}
-
-/* ------------------------------------------------------------------ */
-/* Stop detection (fallback for abrupt stops)                          */
-/* ------------------------------------------------------------------ */
-
-static void stop_detect_handler(struct k_work *work) {
-    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-    struct scroll_inertia_data *data =
-        CONTAINER_OF(dwork, struct scroll_inertia_data, stop_detect_work);
-    const struct scroll_inertia_config *cfg = data->dev->config;
-
-    if (data->inertia_active) {
-        return;
-    }
-
-    /* If the layer became inactive between the last event and this
-     * timer firing, do not start inertia. */
-    if (cfg->layer >= 0 && !zmk_keymap_layer_active(cfg->layer)) {
-        reset_state(data);
-        return;
-    }
-
-    int32_t ax = effective_axis(cfg);
-    bool vel_ok = false;
-    if (ax != AXIS_X) vel_ok |= (abs32(data->vel_y) >= cfg->start_fp);
-    if (ax != AXIS_Y) vel_ok |= (abs32(data->vel_x) >= cfg->start_fp);
-
-    bool mov_ok = data->total_movement >= cfg->move;
-
-    if (vel_ok && mov_ok && data->tracking_count >= MIN_TRACKING_EVENTS) {
-        start_inertia(data, cfg);
-    } else {
-        reset_state(data);
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* Input processor callback                                            */
-/* ------------------------------------------------------------------ */
-
-static int scroll_inertia_handle_event(const struct device *dev,
-                                       struct input_event *event,
-                                       uint32_t param1, uint32_t param2,
-                                       struct zmk_input_processor_state *state) {
-    struct scroll_inertia_data *data = dev->data;
-    const struct scroll_inertia_config *cfg = dev->config;
-
-    if (event->type != INPUT_EV_REL) {
-        return ZMK_INPUT_PROC_CONTINUE;
-    }
+static enum event_class classify_event(const struct input_event *event,
+                                       int32_t ax) {
+    if (event->type != INPUT_EV_REL) return EC_UNTRACKED;
 
     bool is_y = (event->code == INPUT_REL_WHEEL);
     bool is_x = (event->code == INPUT_REL_HWHEEL);
+    if (!is_y && !is_x) return EC_UNTRACKED;
 
-    if (!is_y && !is_x) {
-        return ZMK_INPUT_PROC_CONTINUE;
-    }
+    if (ax == AXIS_Y && is_x) return EC_CROSS_AXIS;
+    if (ax == AXIS_X && is_y) return EC_CROSS_AXIS;
 
+    /* AXIS_BOTH accepts both; AXIS_Y accepts Y; AXIS_X accepts X. */
+    return EC_TRACKED;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-state event handlers                                            */
+/* ------------------------------------------------------------------ */
+
+/* Returns true if the event should still be passed through downstream
+ * with its current value.  False means the handler consumed it (or
+ * zeroed it) and nothing further needs to happen. */
+static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
+                                      const struct scroll_inertia_config *cfg,
+                                      struct input_event *event) {
     int32_t ax = effective_axis(cfg);
-
-    /* ---- Magnitude merge for single-axis modes ----
-     * In axis=1 (Y only) or axis=2 (X only) mode, fold the non-tracked
-     * axis component into the tracked axis so that diagonal rotation
-     * produces the same scroll amount as straight rotation of equal
-     * physical distance.  Skipped when unlock-mod is held (ax becomes
-     * AXIS_BOTH and both axes flow through independently). */
-    if (ax == AXIS_Y && is_x) {
-        data->pending_other = event->value;
-        int32_t cross_mag = abs32(event->value);
-        event->value = 0;
-        data->last_event_time = k_uptime_get();
-        if (data->inertia_active) {
-            /* Vigorous cross-axis rolling means the user wants
-             * direct control back — silently swallowing their motion
-             * is the freeze symptom this guards against. */
-            data->cross_axis_accumulated += cross_mag;
-            if (data->cross_axis_accumulated >= cfg->move) {
-                cancel_inertia(data);
-            }
-        } else {
-            k_work_reschedule(&data->stop_detect_work,
-                              K_MSEC(cfg->release_ms));
-        }
-        return ZMK_INPUT_PROC_CONTINUE;
-    }
-    if (ax == AXIS_X && is_y) {
-        data->pending_other = event->value;
-        int32_t cross_mag = abs32(event->value);
-        event->value = 0;
-        data->last_event_time = k_uptime_get();
-        if (data->inertia_active) {
-            data->cross_axis_accumulated += cross_mag;
-            if (data->cross_axis_accumulated >= cfg->move) {
-                cancel_inertia(data);
-            }
-        } else {
-            k_work_reschedule(&data->stop_detect_work,
-                              K_MSEC(cfg->release_ms));
-        }
-        return ZMK_INPUT_PROC_CONTINUE;
-    }
-
-    if (data->pending_other != 0 && event->value != 0) {
-        int32_t sign = event->value >= 0 ? 1 : -1;
-        event->value = sign * fast_magnitude(event->value,
-                                              data->pending_other);
-        data->pending_other = 0;
-    }
-
-    /* Re-evaluate which axis this event targets after the merge. */
-    is_y = (event->code == INPUT_REL_WHEEL  && ax != AXIS_X);
-    is_x = (event->code == INPUT_REL_HWHEEL && ax != AXIS_Y);
-
-    if (!is_y && !is_x) {
-        return ZMK_INPUT_PROC_CONTINUE;
-    }
-
-    /* ---- State reset triggers ---- */
-    int64_t now = k_uptime_get();
-    bool need_reset = false;
-
-    if (data->last_event_time > 0 &&
-        now - data->last_event_time > GESTURE_TIMEOUT_MS) {
-        need_reset = true;
-    }
-    if (data->suppress_count >= SUPPRESS_SAFETY_LIMIT) {
-        need_reset = true;
-    }
-    /* Stale-inertia detection: if inertia is active but no events
-     * arrived for more than a couple of tick intervals, the ball has
-     * stopped or the layer was briefly toggled.  Either way, the
-     * inertia belongs to a previous interaction and must end. */
-    int32_t tick_ms = safe_tick_ms(cfg->tick_ms);
-    if (data->inertia_active && data->last_event_time > 0 &&
-        now - data->last_event_time > tick_ms * 2) {
-        need_reset = true;
-    }
-
-    if (need_reset) {
-        if (data->inertia_active) {
-            cancel_inertia(data);
-        } else {
-            reset_state(data);
-        }
-        k_work_cancel_delayable(&data->stop_detect_work);
-    }
-    data->last_event_time = now;
-
-    /* ---- Inertia active: absorb same-direction, cancel on reverse ---- */
-    if (data->inertia_active) {
-        if (event->value == 0) {
-            return ZMK_INPUT_PROC_CONTINUE;
-        }
-
-        int32_t inertia_vel = is_y ? data->vel_y : data->vel_x;
-        int32_t event_vel_fp = (int32_t)event->value << FP_SHIFT;
-        bool same_dir = inertia_vel != 0 &&
-                        (event->value > 0) == (inertia_vel > 0);
-
-        if (same_dir) {
-            /* The ball's natural deceleration may briefly fluctuate
-             * above the (faster-decaying) inertia velocity.  Bump
-             * the inertia velocity up to track the ball instead of
-             * cancelling — this keeps the transition seamless. */
-            if (abs32(event_vel_fp) > abs32(inertia_vel)) {
-                if (is_y) data->vel_y = event_vel_fp;
-                if (is_x) data->vel_x = event_vel_fp;
-            }
-            event->value = 0;
-            data->suppress_count++;
-            /* Tracked-axis activity proves the user is not just
-             * cross-rolling.  Clear the cross-axis accumulator so
-             * that a diagonal physical coast (Y and X interleaved)
-             * doesn't slowly add up to the move threshold and
-             * cancel inertia prematurely. */
-            data->cross_axis_accumulated = 0;
-            return ZMK_INPUT_PROC_CONTINUE;
-        }
-
-        /* Reverse direction — user wants to scroll the other way. */
-        cancel_inertia(data);
-        /* Fall through to tracking */
-    }
-
-    /* ---- Tracking ---- */
-    if (event->value == 0) {
-        k_work_reschedule(&data->stop_detect_work, K_MSEC(cfg->release_ms));
-        return ZMK_INPUT_PROC_CONTINUE;
-    }
+    bool is_y = (event->code == INPUT_REL_WHEEL  && ax != AXIS_X);
+    bool is_x = (event->code == INPUT_REL_HWHEEL && ax != AXIS_Y);
 
     data->tracking_count++;
 
@@ -571,14 +399,13 @@ static int scroll_inertia_handle_event(const struct device *dev,
         data->vel_y = clamp_velocity(data->vel_y, cfg->limit_fp);
         data->total_movement += abs32(event->value);
 
-        /* Direction reversal — reset peak, movement, and the tracking
-         * counter for the new direction so the old direction's state
-         * doesn't trigger false deceleration or premature arming.
-         * Without the tracking_count reset, rapid alternating flicks
-         * can stay past MIN_TRACKING_EVENTS and let inertia fire from
-         * a very low threshold on the reversed direction. */
         if (data->peak_vel_y != 0 &&
             (data->vel_y > 0) != (data->peak_vel_y > 0)) {
+            /* Direction reversal — reset direction-specific state so
+             * the old direction's peak doesn't trigger false
+             * deceleration or premature arming.  tracking_count set
+             * to 1 (not 0) because this event belongs to the new
+             * direction's gesture. */
             data->peak_vel_y = data->vel_y;
             data->decel_count = 0;
             data->total_movement = abs32(event->value);
@@ -646,23 +473,321 @@ static int scroll_inertia_handle_event(const struct device *dev,
         if (decelerating) {
             data->decel_count++;
             if (data->decel_count >= DECEL_CONFIRM_COUNT) {
-                start_inertia(data, cfg);
+                to_coasting(data, cfg);
                 event->value = 0;
-                return ZMK_INPUT_PROC_CONTINUE;
+                return false;
             }
         } else {
             data->decel_count = 0;
         }
     }
 
-    /* Event passed through */
-    data->suppress_count = 0;
+    /* Event is passing through — schedule stop_detect so that a sudden
+     * release (no more events) can still trigger inertia. */
     k_work_reschedule(&data->stop_detect_work, K_MSEC(cfg->release_ms));
+    return true;
+}
 
-    /* Swap output axis if the configured modifier is held.
-     * unlock-mod takes precedence: when both axes are free, swapping
-     * has no meaning. */
-    if (ax != AXIS_BOTH && swap_active(cfg)) {
+/* Returns true to pass the event through, false if consumed/zeroed. */
+static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
+                                      const struct scroll_inertia_config *cfg,
+                                      struct input_event *event) {
+    int32_t ax = effective_axis(cfg);
+    bool is_y = (event->code == INPUT_REL_WHEEL);
+    int32_t inertia_vel = is_y ? data->vel_y : data->vel_x;
+    int32_t event_vel_fp = (int32_t)event->value << FP_SHIFT;
+    bool same_dir = inertia_vel != 0 &&
+                    (event->value > 0) == (inertia_vel > 0);
+
+    if (same_dir) {
+        /* Absorb.  The ball's natural deceleration may briefly
+         * fluctuate above the (faster-decaying) inertia velocity —
+         * bump the inertia velocity up to track the ball instead of
+         * cancelling, keeping the handoff seamless. */
+        if (abs32(event_vel_fp) > abs32(inertia_vel)) {
+            if (is_y) data->vel_y = event_vel_fp;
+            else      data->vel_x = event_vel_fp;
+        }
+        event->value = 0;
+        data->suppress_count++;
+        /* Tracked-axis activity means the user isn't just cross-
+         * rolling; clear the cross accumulator so diagonal coasts
+         * (interleaved tracked/cross events) don't reach the break
+         * threshold through accumulated X alone. */
+        data->cross_axis_accumulated = 0;
+
+        if (data->suppress_count >= SUPPRESS_SAFETY_LIMIT) {
+            /* Long same-direction absorption — user has been actively
+             * rolling past a stale coast.  Drop back to TRACKING and
+             * let the current event flow. */
+            to_tracking_from_coasting(data);
+            /* The event's value was zeroed above; do not revive it.
+             * Subsequent events will be processed in TRACKING fresh. */
+        }
+        return false;
+    }
+
+    /* Reverse direction — user wants to scroll the other way.  Cancel
+     * inertia and re-process this event in TRACKING. */
+    to_tracking_from_coasting(data);
+    return handle_tracked_in_tracking(data, cfg, event);
+}
+
+/* Single-axis cross-axis events never pass through.  They merge into
+ * the next tracked-axis event and, during COASTING, count toward the
+ * freeze-break threshold. */
+static void handle_cross_axis(struct scroll_inertia_data *data,
+                              const struct scroll_inertia_config *cfg,
+                              struct input_event *event) {
+    int32_t cross_mag = abs32(event->value);
+    data->pending_other = event->value;
+    event->value = 0;
+
+    if (data->state == SS_COASTING) {
+        data->cross_axis_accumulated += cross_mag;
+        if (data->cross_axis_accumulated >= cfg->move) {
+            /* Vigorous cross-axis rolling — user is driving the
+             * untracked axis.  Drop the silent coast so they regain
+             * direct control. */
+            to_tracking_from_coasting(data);
+        }
+    } else {
+        k_work_reschedule(&data->stop_detect_work,
+                          K_MSEC(cfg->release_ms));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Implicit state resets                                               */
+/* ------------------------------------------------------------------ */
+
+static bool should_reset_on_timeout(struct scroll_inertia_data *data,
+                                   const struct scroll_inertia_config *cfg,
+                                   int64_t now) {
+    /* Gesture timeout: long silence means the next event is a brand
+     * new gesture.  Applies in any state. */
+    if (data->last_event_time > 0 &&
+        now - data->last_event_time > GESTURE_TIMEOUT_MS) {
+        return true;
+    }
+
+    /* Stale-inertia: inertia is scheduled but the event stream has
+     * paused long enough that the coast is no longer "live".  Only
+     * meaningful in COASTING. */
+    int32_t tick_ms = safe_tick_ms(cfg->tick_ms);
+    if (data->state == SS_COASTING && data->last_event_time > 0 &&
+        now - data->last_event_time > tick_ms * 2) {
+        return true;
+    }
+
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Delayed-work handlers                                               */
+/* ------------------------------------------------------------------ */
+
+static void inertia_tick_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct scroll_inertia_data *data =
+        CONTAINER_OF(dwork, struct scroll_inertia_data, inertia_tick_work);
+    const struct scroll_inertia_config *cfg = data->dev->config;
+
+    if (data->state != SS_COASTING) {
+        return;
+    }
+
+    /* Layer gate */
+    if (cfg->layer >= 0 && !zmk_keymap_layer_active(cfg->layer)) {
+        to_idle(data);
+        return;
+    }
+
+    /* Duration gate (safety cap only — the natural exponential decay
+     * already gives lighter flicks shorter inertia because lower
+     * initial velocity reaches the stop threshold sooner). */
+    if (k_uptime_get() - data->inertia_start_time > cfg->span_ms) {
+        to_idle(data);
+        return;
+    }
+
+    int32_t ax = effective_axis(cfg);
+
+    /* Three-stage decay.  Set fast=0 and slow=0 with all three rates
+     * equal for a single-curve (iOS-style) decay. */
+    if (ax != AXIS_X) {
+        int32_t av = abs32(data->vel_y);
+        int32_t d = av > cfg->fast_fp ? cfg->decay_fast
+                  : av > cfg->slow_fp ? cfg->decay_slow
+                  :                     cfg->decay_tail;
+        data->vel_y = (int64_t)data->vel_y * d / 1000;
+        /* Additive (Coulomb) friction: constant absolute decel per
+         * tick.  Configured in permille of scroll units — friction=1000
+         * means 1 scroll unit subtracted per tick.  Grows in relative
+         * impact as velocity shrinks, which is the whole point. */
+        if (cfg->friction_fp > 0) {
+            if (data->vel_y > cfg->friction_fp)       data->vel_y -= cfg->friction_fp;
+            else if (data->vel_y < -cfg->friction_fp) data->vel_y += cfg->friction_fp;
+            else                                       data->vel_y = 0;
+        }
+    }
+    if (ax != AXIS_Y) {
+        int32_t av = abs32(data->vel_x);
+        int32_t d = av > cfg->fast_fp ? cfg->decay_fast
+                  : av > cfg->slow_fp ? cfg->decay_slow
+                  :                     cfg->decay_tail;
+        data->vel_x = (int64_t)data->vel_x * d / 1000;
+        if (cfg->friction_fp > 0) {
+            if (data->vel_x > cfg->friction_fp)       data->vel_x -= cfg->friction_fp;
+            else if (data->vel_x < -cfg->friction_fp) data->vel_x += cfg->friction_fp;
+            else                                       data->vel_x = 0;
+        }
+    }
+
+    /* Stop gate */
+    bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;
+    bool below_x = (ax == AXIS_Y) || abs32(data->vel_x) < cfg->stop_fp;
+    if (below_y && below_x) {
+        to_idle(data);
+        return;
+    }
+
+    /* Accumulate sub-unit values and emit integer scroll deltas */
+    int16_t emit_x = 0, emit_y = 0;
+    int32_t sdiv = safe_scale_div(cfg->scale_div);
+    if (ax != AXIS_X) {
+        data->accum_y += (int64_t)data->vel_y * cfg->scale / sdiv;
+        emit_y = (int16_t)(data->accum_y >> FP_SHIFT);
+        data->accum_y -= (int32_t)emit_y << FP_SHIFT;
+    }
+    if (ax != AXIS_Y) {
+        data->accum_x += (int64_t)data->vel_x * cfg->scale / sdiv;
+        emit_x = (int16_t)(data->accum_x >> FP_SHIFT);
+        data->accum_x -= (int32_t)emit_x << FP_SHIFT;
+    }
+
+    if (emit_x != 0 || emit_y != 0) {
+        int16_t out_x = emit_x;
+        int16_t out_y = emit_y;
+        /* swap-mod has no effect when unlock-mod is freeing both axes */
+        if (ax != AXIS_BOTH && swap_active(cfg)) {
+            out_x = emit_y;
+            out_y = emit_x;
+        }
+        zmk_hid_mouse_movement_set(0, 0);
+        zmk_hid_mouse_scroll_set(out_x, out_y);
+        zmk_endpoints_send_mouse_report();
+        zmk_hid_mouse_scroll_set(0, 0);
+    }
+
+    k_work_schedule(&data->inertia_tick_work,
+                    K_MSEC(safe_tick_ms(cfg->tick_ms)));
+}
+
+static void stop_detect_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct scroll_inertia_data *data =
+        CONTAINER_OF(dwork, struct scroll_inertia_data, stop_detect_work);
+    const struct scroll_inertia_config *cfg = data->dev->config;
+
+    /* stop_detect only runs as a TRACKING → {COASTING | IDLE} bridge;
+     * if we somehow fire while coasting or idle, noop. */
+    if (data->state != SS_TRACKING) {
+        return;
+    }
+
+    if (cfg->layer >= 0 && !zmk_keymap_layer_active(cfg->layer)) {
+        to_idle(data);
+        return;
+    }
+
+    int32_t ax = effective_axis(cfg);
+    bool vel_ok = false;
+    if (ax != AXIS_X) vel_ok |= (abs32(data->vel_y) >= cfg->start_fp);
+    if (ax != AXIS_Y) vel_ok |= (abs32(data->vel_x) >= cfg->start_fp);
+    bool mov_ok = data->total_movement >= cfg->move;
+
+    if (vel_ok && mov_ok && data->tracking_count >= MIN_TRACKING_EVENTS) {
+        to_coasting(data, cfg);
+    } else {
+        to_idle(data);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Input processor callback                                            */
+/* ------------------------------------------------------------------ */
+
+static int scroll_inertia_handle_event(const struct device *dev,
+                                       struct input_event *event,
+                                       uint32_t param1, uint32_t param2,
+                                       struct zmk_input_processor_state *state) {
+    struct scroll_inertia_data *data = dev->data;
+    const struct scroll_inertia_config *cfg = dev->config;
+
+    int32_t ax = effective_axis(cfg);
+    enum event_class ec = classify_event(event, ax);
+
+    if (ec == EC_UNTRACKED) {
+        return ZMK_INPUT_PROC_CONTINUE;
+    }
+
+    /* Implicit resets from timing (applies regardless of event class
+     * so that a long silence followed by any event lands us in IDLE). */
+    int64_t now = k_uptime_get();
+    if (should_reset_on_timeout(data, cfg, now)) {
+        to_idle(data);
+    }
+    data->last_event_time = now;
+
+    /* Cross-axis events are self-contained: they don't enter the state
+     * machine dispatch (they're buffered/counted and early-returned). */
+    if (ec == EC_CROSS_AXIS) {
+        handle_cross_axis(data, cfg, event);
+        return ZMK_INPUT_PROC_CONTINUE;
+    }
+
+    /* EC_TRACKED from here on. */
+
+    /* Apply pending cross-axis magnitude merge if we're in a
+     * single-axis mode and the previous event stashed a value.
+     * AXIS_BOTH never buffers, so pending_other stays zero there. */
+    if (data->pending_other != 0 && event->value != 0) {
+        int32_t sign = event->value >= 0 ? 1 : -1;
+        event->value = sign * fast_magnitude(event->value,
+                                              data->pending_other);
+        data->pending_other = 0;
+    }
+
+    /* Zero-value tracked events are treated as idle keep-alives: they
+     * extend the stop_detect timer but don't drive state changes. */
+    if (event->value == 0) {
+        if (data->state == SS_TRACKING) {
+            k_work_reschedule(&data->stop_detect_work,
+                              K_MSEC(cfg->release_ms));
+        }
+        return ZMK_INPUT_PROC_CONTINUE;
+    }
+
+    /* Dispatch to the state handler. */
+    bool pass_through = true;
+    switch (data->state) {
+    case SS_IDLE:
+        to_tracking_from_idle(data);
+        pass_through = handle_tracked_in_tracking(data, cfg, event);
+        break;
+    case SS_TRACKING:
+        pass_through = handle_tracked_in_tracking(data, cfg, event);
+        break;
+    case SS_COASTING:
+        pass_through = handle_tracked_in_coasting(data, cfg, event);
+        break;
+    }
+
+    if (pass_through && ax != AXIS_BOTH && swap_active(cfg)) {
+        /* Only swap the output channel when we're actually letting
+         * the event through; inertia-absorbed events have value=0
+         * and swapping them is a no-op anyway. */
         if (event->code == INPUT_REL_WHEEL)       event->code = INPUT_REL_HWHEEL;
         else if (event->code == INPUT_REL_HWHEEL) event->code = INPUT_REL_WHEEL;
     }
@@ -677,6 +802,7 @@ static int scroll_inertia_handle_event(const struct device *dev,
 static int scroll_inertia_init(const struct device *dev) {
     struct scroll_inertia_data *data = dev->data;
     data->dev = dev;
+    data->state = SS_IDLE;
     k_work_init_delayable(&data->stop_detect_work, stop_detect_handler);
     k_work_init_delayable(&data->inertia_tick_work, inertia_tick_handler);
     return 0;

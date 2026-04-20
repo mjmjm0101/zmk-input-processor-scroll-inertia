@@ -454,18 +454,26 @@ The processor runs a small three-state machine per instance:
    transitions to TRACKING.
 2. **TRACKING.**  Every event updates a per-axis smoothed velocity
    (moving average) and a per-axis "peak so far" that slowly drifts
-   down toward the current value when no new high is reached.  Arming
-   is angle-invariant: it compares the *vector magnitude* of the
-   peaks (`√(peak_x² + peak_y²)`, approximated) against `start`, so a
-   sloppy-angle flick crosses the threshold at the same overall
-   strength as an axis-aligned one.  Once magnitude ≥ `start`, total
-   movement ≥ `move`, and at least 10 events have been seen, the
-   gesture is *armed* — if the smoothed velocity then drops below 85%
-   of the peak for 3 events in a row, the processor transitions to
-   COASTING.  If no events arrive for `release` ms while armed, a
-   fallback "stop detect" timer performs the same check for abrupt
-   releases.
-3. **COASTING.**  A timer fires every `tick` ms.  Each tick multiplies
+   down toward the current value when no new high is reached.  The
+   tracking state is fully angle-invariant: EMA, peak, and total
+   movement are all fed from the event's **raw** delta, so a
+   cross-axis event contributes exactly once and a tracked-axis
+   event exactly once — no double counting through the merge.  Both
+   arming and deceleration detection compare *vector magnitudes*
+   (`√(peak_x² + peak_y²)`, approximated) rather than per-axis
+   values, so a sloppy-angle flick crosses thresholds at the same
+   overall strength as an axis-aligned one.  Once magnitude ≥
+   `start`, total movement ≥ `move`, and at least 10 events have
+   been seen, the gesture is *armed* — if the magnitude then drops
+   below 85% of the peak magnitude for 3 events in a row, the
+   processor transitions to COASTING.  If no events arrive for
+   `release` ms while armed, a fallback "stop detect" timer performs
+   the same check for abrupt releases.
+3. **COASTING.**  On entry the tracked axis's initial velocity is
+   boosted to the full vector magnitude of the peak — so a diagonal
+   flick coasts at the same strength as an axis-aligned flick of
+   the same physical vector strength, not just the tracked axis's
+   component.  A timer fires every `tick` ms.  Each tick multiplies
    velocity by the configured decay, subtracts friction, accumulates,
    and emits whole scroll units to the host.  Tracking-axis events
    that arrive in the same direction are absorbed (possibly bumping

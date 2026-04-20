@@ -347,6 +347,27 @@ static void to_coasting(struct scroll_inertia_data *data,
     clear_coasting_fields(data);
     data->inertia_start_time = k_uptime_get();
     data->start_movement = data->total_movement;
+
+    /* Angle-invariant initial inertia strength:  in a single-axis
+     * mode, boost the tracked axis's velocity to the full vector
+     * magnitude of the gesture's peak.  Without this, a 45° flick
+     * would coast weaker than an axis-aligned flick of the same
+     * physical vector strength (the tracked axis's own EMA only
+     * captures its own component).  Guarded by `peak_* != 0` on the
+     * tracked axis so a pure cross-axis gesture doesn't get
+     * unsolicited Y/X inertia. */
+    int32_t ax = effective_axis(cfg);
+    int32_t peak_mag = fast_magnitude(data->peak_vel_x, data->peak_vel_y);
+    if (ax == AXIS_Y && data->peak_vel_y != 0) {
+        int32_t sign = (data->peak_vel_y > 0) ? 1 : -1;
+        data->vel_y = clamp_velocity(peak_mag * sign, cfg->limit_fp);
+    } else if (ax == AXIS_X && data->peak_vel_x != 0) {
+        int32_t sign = (data->peak_vel_x > 0) ? 1 : -1;
+        data->vel_x = clamp_velocity(peak_mag * sign, cfg->limit_fp);
+    }
+    /* AXIS_BOTH keeps per-axis vel_y and vel_x as they are — the user
+     * wants diagonal coasting in that mode, not magnitude-folded Y. */
+
     k_work_cancel_delayable(&data->stop_detect_work);
     data->state = SS_COASTING;
 
@@ -382,10 +403,19 @@ static enum event_class classify_event(const struct input_event *event,
 
 /* Returns true if the event should still be passed through downstream
  * with its current value.  False means the handler consumed it (or
- * zeroed it) and nothing further needs to happen. */
+ * zeroed it) and nothing further needs to happen.
+ *
+ * `raw_value` is the event's delta before the cross-axis merge was
+ * applied to event->value.  We feed the EMA / peak / total_movement
+ * from the raw value so the per-axis trackers don't double-count the
+ * cross-axis contribution (which is already captured independently
+ * through vel_x/vel_y on its own events).  event->value keeps the
+ * merged magnitude because it's what flows downstream (pre-inertia
+ * scroll output should still be boosted for diagonal rolls). */
 static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
                                       const struct scroll_inertia_config *cfg,
-                                      struct input_event *event) {
+                                      struct input_event *event,
+                                      int32_t raw_value) {
     int32_t ax = effective_axis(cfg);
     bool is_y = (event->code == INPUT_REL_WHEEL  && ax != AXIS_X);
     bool is_x = (event->code == INPUT_REL_HWHEEL && ax != AXIS_Y);
@@ -393,11 +423,11 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
     data->tracking_count++;
 
     if (is_y) {
-        int32_t delta_fp = (int32_t)event->value << FP_SHIFT;
+        int32_t delta_fp = raw_value << FP_SHIFT;
         data->vel_y = ((int64_t)delta_fp * cfg->gain +
                        (int64_t)data->vel_y * cfg->blend) / 1000;
         data->vel_y = clamp_velocity(data->vel_y, cfg->limit_fp);
-        data->total_movement += abs32(event->value);
+        data->total_movement += abs32(raw_value);
 
         if (data->peak_vel_y != 0 &&
             (data->vel_y > 0) != (data->peak_vel_y > 0)) {
@@ -408,7 +438,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
              * direction's gesture. */
             data->peak_vel_y = data->vel_y;
             data->decel_count = 0;
-            data->total_movement = abs32(event->value);
+            data->total_movement = abs32(raw_value);
             data->tracking_count = 1;
         } else if (abs32(data->vel_y) > abs32(data->peak_vel_y)) {
             data->peak_vel_y = data->vel_y;
@@ -419,17 +449,17 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
         }
     }
     if (is_x) {
-        int32_t delta_fp = (int32_t)event->value << FP_SHIFT;
+        int32_t delta_fp = raw_value << FP_SHIFT;
         data->vel_x = ((int64_t)delta_fp * cfg->gain +
                        (int64_t)data->vel_x * cfg->blend) / 1000;
         data->vel_x = clamp_velocity(data->vel_x, cfg->limit_fp);
-        data->total_movement += abs32(event->value);
+        data->total_movement += abs32(raw_value);
 
         if (data->peak_vel_x != 0 &&
             (data->vel_x > 0) != (data->peak_vel_x > 0)) {
             data->peak_vel_x = data->vel_x;
             data->decel_count = 0;
-            data->total_movement = abs32(event->value);
+            data->total_movement = abs32(raw_value);
             data->tracking_count = 1;
         } else if (abs32(data->vel_x) > abs32(data->peak_vel_x)) {
             data->peak_vel_x = data->vel_x;
@@ -450,25 +480,22 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
     bool armed = vel_armed && data->total_movement >= cfg->move
                  && data->tracking_count >= MIN_TRACKING_EVENTS;
 
-    /* Deceleration detection */
+    /* Deceleration detection — magnitude-based for angle invariance.
+     * A flick slowing down in X but steady in Y (or vice versa) is
+     * still slowing down overall; single-axis decel checks used to
+     * miss those cases. */
     if (armed) {
+        int32_t cur_magnitude = fast_magnitude(data->vel_x, data->vel_y);
         bool decelerating = false;
-        if (is_y && ax != AXIS_X &&
-            abs32(data->vel_y) <
-                abs32(data->peak_vel_y) * DECEL_PEAK_RATIO / 1000) {
-            /* Only count when the raw event direction matches the peak.
-             * During a reversal the EMA lags behind the actual direction
-             * and would otherwise look like deceleration of the old peak. */
-            if (data->peak_vel_y == 0 ||
-                (event->value > 0) == (data->peak_vel_y > 0)) {
-                decelerating = true;
-            }
-        }
-        if (is_x && ax != AXIS_Y &&
-            abs32(data->vel_x) <
-                abs32(data->peak_vel_x) * DECEL_PEAK_RATIO / 1000) {
-            if (data->peak_vel_x == 0 ||
-                (event->value > 0) == (data->peak_vel_x > 0)) {
+        if (cur_magnitude <
+                (int64_t)peak_magnitude * DECEL_PEAK_RATIO / 1000) {
+            /* Direction guard: the event's own axis peak must share
+             * sign with the event.  During a reversal the EMA on
+             * that axis lags and the overall magnitude can dip for a
+             * reason other than real deceleration. */
+            int32_t axis_peak = is_y ? data->peak_vel_y : data->peak_vel_x;
+            if (axis_peak == 0 ||
+                (raw_value > 0) == (axis_peak > 0)) {
                 decelerating = true;
             }
         }
@@ -491,10 +518,14 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
     return true;
 }
 
-/* Returns true to pass the event through, false if consumed/zeroed. */
+/* Returns true to pass the event through, false if consumed/zeroed.
+ * `raw_value` is forwarded to handle_tracked_in_tracking if this
+ * event triggers a reverse-cancel fall-through (so the new tracking
+ * gesture starts from the same unmerged delta as any other event). */
 static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
                                       const struct scroll_inertia_config *cfg,
-                                      struct input_event *event) {
+                                      struct input_event *event,
+                                      int32_t raw_value) {
     int32_t ax = effective_axis(cfg);
     bool is_y = (event->code == INPUT_REL_WHEEL);
     int32_t inertia_vel = is_y ? data->vel_y : data->vel_x;
@@ -533,7 +564,7 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
     /* Reverse direction — user wants to scroll the other way.  Cancel
      * inertia and re-process this event in TRACKING. */
     to_tracking_from_coasting(data);
-    return handle_tracked_in_tracking(data, cfg, event);
+    return handle_tracked_in_tracking(data, cfg, event, raw_value);
 }
 
 /* Single-axis cross-axis events never pass through downstream.  They
@@ -594,11 +625,11 @@ static void handle_cross_axis(struct scroll_inertia_data *data,
         }
 
         data->tracking_count++;
-        /* NOTE on total_movement: cross-axis magnitude is intentionally
-         * NOT added here.  It already contributes to total_movement
-         * indirectly through the next tracked-axis event's
-         * fast_magnitude merge.  Double-counting would let pure
-         * cross-axis rolling satisfy the move threshold on its own. */
+        /* total_movement receives the raw cross-axis magnitude.  The
+         * tracked-axis handler now feeds EMA/peak/total from raw
+         * (unmerged) values too, so no double-counting: each event
+         * contributes its own |delta| exactly once. */
+        data->total_movement += cross_mag;
 
         k_work_reschedule(&data->stop_detect_work,
                           K_MSEC(cfg->release_ms));
@@ -800,7 +831,17 @@ static int scroll_inertia_handle_event(const struct device *dev,
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
-    /* EC_TRACKED from here on. */
+    /* EC_TRACKED from here on.
+     *
+     * Capture the raw delta before the cross-axis merge is applied.
+     * The handlers use `raw_value` for all tracking state updates
+     * (EMA, peak, total_movement) so the vector-magnitude view of
+     * the gesture isn't double-counted through merged Y and
+     * independent vel_x.  event->value gets the merged magnitude
+     * because that's what flows downstream as the direct scroll
+     * output and what the COASTING absorb/bump logic compares
+     * against the inertia velocity. */
+    int32_t raw_value = event->value;
 
     /* Apply pending cross-axis magnitude merge if we're in a
      * single-axis mode and the previous event stashed a value.
@@ -814,7 +855,7 @@ static int scroll_inertia_handle_event(const struct device *dev,
 
     /* Zero-value tracked events are treated as idle keep-alives: they
      * extend the stop_detect timer but don't drive state changes. */
-    if (event->value == 0) {
+    if (raw_value == 0) {
         if (data->state == SS_TRACKING) {
             k_work_reschedule(&data->stop_detect_work,
                               K_MSEC(cfg->release_ms));
@@ -827,13 +868,13 @@ static int scroll_inertia_handle_event(const struct device *dev,
     switch (data->state) {
     case SS_IDLE:
         to_tracking_from_idle(data);
-        pass_through = handle_tracked_in_tracking(data, cfg, event);
+        pass_through = handle_tracked_in_tracking(data, cfg, event, raw_value);
         break;
     case SS_TRACKING:
-        pass_through = handle_tracked_in_tracking(data, cfg, event);
+        pass_through = handle_tracked_in_tracking(data, cfg, event, raw_value);
         break;
     case SS_COASTING:
-        pass_through = handle_tracked_in_coasting(data, cfg, event);
+        pass_through = handle_tracked_in_coasting(data, cfg, event, raw_value);
         break;
     }
 

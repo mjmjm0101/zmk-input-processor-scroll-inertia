@@ -536,14 +536,18 @@ static int scroll_inertia_handle_event(const struct device *dev,
         data->vel_y = clamp_velocity(data->vel_y, cfg->limit_fp);
         data->total_movement += abs32(event->value);
 
-        /* Direction reversal — reset peak and movement for the new
-         * direction so the old direction's state doesn't trigger
-         * false deceleration or premature arming. */
+        /* Direction reversal — reset peak, movement, and the tracking
+         * counter for the new direction so the old direction's state
+         * doesn't trigger false deceleration or premature arming.
+         * Without the tracking_count reset, rapid alternating flicks
+         * can stay past MIN_TRACKING_EVENTS and let inertia fire from
+         * a very low threshold on the reversed direction. */
         if (data->peak_vel_y != 0 &&
             (data->vel_y > 0) != (data->peak_vel_y > 0)) {
             data->peak_vel_y = data->vel_y;
             data->decel_count = 0;
             data->total_movement = abs32(event->value);
+            data->tracking_count = 1;
         } else if (abs32(data->vel_y) > abs32(data->peak_vel_y)) {
             data->peak_vel_y = data->vel_y;
         } else {
@@ -564,6 +568,7 @@ static int scroll_inertia_handle_event(const struct device *dev,
             data->peak_vel_x = data->vel_x;
             data->decel_count = 0;
             data->total_movement = abs32(event->value);
+            data->tracking_count = 1;
         } else if (abs32(data->vel_x) > abs32(data->peak_vel_x)) {
             data->peak_vel_x = data->vel_x;
         } else {

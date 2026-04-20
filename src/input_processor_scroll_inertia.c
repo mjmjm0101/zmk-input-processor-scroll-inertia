@@ -17,28 +17,29 @@
  * ------------
  * Each instance is modelled as an explicit 3-state machine:
  *
- *       ┌─── gesture timeout / stop_detect fail ───┐
- *       │                                          ▼
- *       │                                        IDLE
- *       │                                          │
- *       │                                          │ first tracked event
- *       │                                          ▼
- *       │        ┌─(reverse / cross break / suppress)──┐
- *       │        │                                      │
- *       │        ▼                                      │
- *   TRACKING ─(arming + decel confirmed)──────────▶ COASTING
- *       ▲                                               │
- *       │                                               │ vel<stop,
- *       │                                               │ span,
- *       │                                               │ layer-off
- *       │                                               ▼
- *       └───── (via IDLE) ───────────────────────────▶ IDLE
+ *                              IDLE
+ *                                │
+ *                                │ first tracked event
+ *                                ▼
+ *       ┌─(reverse / cross break / suppress)──┐
+ *       │                                      │
+ *       ▼                                      │
+ *   TRACKING ─(arming + decel, or stop_detect)──▶ COASTING
+ *       │                                        │
+ *       │    (vel<stop / span / layer-off)       │
+ *       └────────────────────────────────────────┘
+ *                    ▼
+ *                   IDLE
+ *
+ * A gesture timeout (no events for GESTURE_TIMEOUT_MS) and the
+ * stale-inertia check (no events for two ticks while COASTING) can
+ * also force any state back to IDLE — see should_reset_on_timeout().
  *
  * Only one state is active at a time.  Every event is classified
- * (NOP / cross-axis / tracked-axis), then dispatched to the current
- * state's handler.  State transitions are explicit function calls
- * (to_idle / to_tracking_from_* / to_coasting) so the code can be
- * audited by grepping for them.
+ * (untracked / cross-axis / tracked-axis), then dispatched to the
+ * current state's handler.  State transitions are explicit function
+ * calls (to_idle / to_tracking_from_* / to_coasting) so the code can
+ * be audited by grepping for them.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -132,9 +133,11 @@ enum scroll_state {
 };
 
 enum event_class {
-    EC_UNTRACKED,   /* not a scroll event, or zero value — ignore */
+    EC_UNTRACKED,   /* not a REL scroll event — pass straight through */
     EC_CROSS_AXIS,  /* single-axis mode, event is on the other axis */
-    EC_TRACKED,     /* scroll event on the tracked axis, non-zero */
+    EC_TRACKED,     /* scroll event on a tracked axis (zero values
+                     * are still classified as EC_TRACKED and filtered
+                     * later as idle keep-alives) */
 };
 
 /* ------------------------------------------------------------------ */
@@ -180,8 +183,12 @@ struct scroll_inertia_data {
 
     /* --- TRACKING fields --- */
 
-    /* Velocity EMA in fixed-point (×256).  Also used in COASTING as
-     * the decaying velocity; re-initialised when TRACKING starts. */
+    /* Velocity EMA in fixed-point (×256).  Updated each event from
+     * the raw delta in TRACKING.  Inherited into COASTING (where the
+     * tick handler decays it) and, in single-axis mode, boosted to
+     * the vector-magnitude peak on the TRACKING → COASTING
+     * transition so diagonal flicks coast at full strength.
+     * Cleared when TRACKING starts. */
     int32_t vel_x;
     int32_t vel_y;
 

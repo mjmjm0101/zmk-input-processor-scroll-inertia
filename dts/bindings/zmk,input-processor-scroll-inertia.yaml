@@ -113,8 +113,9 @@ properties:
     description: |
       Constant absolute deceleration subtracted from velocity every
       tick, in permille of a scroll unit.  friction=1000 subtracts
-      1 scroll unit per tick; friction=50 subtracts 0.05 per tick.
-      0 disables (pure exponential decay).
+      1 scroll unit per tick; friction=35 (the default) subtracts
+      0.035.  Set to 0 to disable and fall back to pure exponential
+      decay.
 
       Coulomb (dry) friction model.  Unlike `decay-*` which is
       multiplicative and gives every flick the same *relative* tail
@@ -125,10 +126,10 @@ properties:
       affected.
 
       Values below ~4 are lost to fixed-point truncation (internal
-      representation zero) — start from 10 or higher.
-
-      Typical values: 50–200.  Raise until small flicks stop where
-      you want; values above ~500 visibly shorten large flicks too.
+      representation zero).  The default 35 balances small-flick
+      stop timing without noticeably clipping large flicks; raise it
+      toward ~100 for a firmer feel, drop toward 0 for a longer
+      tail.  Values above ~500 visibly shorten large flicks too.
 
   stop:
     type: int

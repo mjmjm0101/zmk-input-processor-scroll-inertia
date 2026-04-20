@@ -22,10 +22,12 @@ A ZMK input processor that watches scroll events on a single axis,
 detects when you've flicked the ball and let go, and then keeps
 emitting smoothly fading scroll output until it naturally stops.
 
-The fade follows the same simple rule iOS uses: each tick, multiply the
-velocity by a constant slightly less than 1.  That's it — one number
-gives you the whole curve.  (Optional multi-stage settings are there if
-you want different behaviour at high vs low speeds.)
+The fade is a straightforward two-part model: each tick, multiply the
+velocity by a constant slightly less than 1 (iOS-style exponential
+decay), then subtract a tiny constant (a touch of friction so small
+flicks don't glide forever).  Between the two, three numbers give you
+the whole curve.  Optional multi-stage settings are there if you want
+different behaviour at high vs low speeds.
 
 ## What this module isn't
 
@@ -283,27 +285,29 @@ in permille of a scroll unit per tick (`friction=1000` subtracts 1
 unit/tick).  Because it subtracts the same amount regardless of
 current velocity, its relative bite grows as velocity shrinks:
 
-| Phase | Exp decel (at `decay-fast=990`) | Friction `friction=100` | Who dominates |
+| Phase | Exp decel (at `decay-fast=990`) | Friction `friction=35` (default) | Who dominates |
 |---|---|---|---|
-| Large flick peak (vel=600) | −6/tick (1.0%) | −0.1/tick (0.017%) | Exponential |
-| Mid (vel=100) | −1/tick (1.0%) | −0.1/tick (0.1%) | Exponential |
-| Tail (vel=20) | −0.2/tick (1.0%) | −0.1/tick (0.5%) | Friction |
-| Near-stop (vel=5) | −0.05/tick (1.0%) | −0.1/tick (2.0%) | Friction |
+| Large flick peak (vel=600) | −6/tick (1.0%) | −0.035/tick (0.006%) | Exponential |
+| Mid (vel=100) | −1/tick (1.0%) | −0.035/tick (0.035%) | Exponential |
+| Tail (vel=20) | −0.2/tick (1.0%) | −0.035/tick (0.175%) | Exponential |
+| Near-stop (vel=5) | −0.05/tick (1.0%) | −0.035/tick (0.7%) | Roughly even |
 
 Small flicks spend more of their run at low velocity, where friction
-dominates, so they're shortened relatively more than large flicks.
+bites harder relative to the EMA decay, so they stop sooner than a
+pure-exponential coast would leave them.
 
 **Caveat:** friction is additive and applies every tick for the full
-coast.  Its total effect over a long coast is substantial, so big
-flicks still feel *some* shortening — more than the per-tick
-percentages would suggest.  If you want big flicks untouched, keep
-`friction` small.
+coast.  Its total effect over a long coast is noticeable, so very
+high `friction` values clip big flicks too.  The default `35` is
+tuned to shorten small flicks without being felt on big ones.
 
 **Precision:** values below ~4 truncate to zero internally (8-bit
-fixed point).  Start at `friction = 10` or higher.
+fixed point).  If you want to disable friction entirely, set it to
+`0` (not a small positive number).
 
-Start with `friction = 50`, raise until small flicks stop where you
-want.  Values above `~500` visibly shorten large flicks too.
+To tune: raise toward ~100 for a firmer stop on small flicks, drop
+toward `0` for a longer, purely-exponential tail.  Values above
+`~500` visibly shorten large flicks too.
 
 ### About `scale` / `scale-div`
 
@@ -389,23 +393,23 @@ with one parameter, before you reach for multi-stage.
 
 ### Shorten small flicks with `friction`
 
-If large flicks feel right but small flicks still glide a bit too
-long, turn on `friction`.  It's an additive deceleration on top of
-`decay-*`, configured in permille of a scroll unit per tick, and
-because it subtracts a constant amount per tick, its relative bite
-grows as velocity shrinks.
+The default `friction = 35` already adds a gentle additive stop so
+small flicks don't glide forever.  If the feel is still off, adjust
+in either direction.  Representative coast times at different
+friction values (pure exponential vs friction-augmented):
 
 | Value | Large flick (v=600) | Small flick (v=75) | Notes |
 |---|---|---|---|
-| `0` (default) | 3.5 s | 1.9 s | Pure exponential, no asymmetry. |
-| `50` | 3.1 s (−12%) | 1.5 s (−20%) | Subtle — small flicks noticeably shorter. |
-| `100` | 2.8 s (−20%) | 1.3 s (−30%) | Balanced sweet spot for most setups. |
-| `200` | 2.5 s (−30%) | 1.0 s (−47%) | Aggressive — large flicks start to feel snappier too. |
-| `500`+ | 1.9 s (−46%) or less | sub-second | Too much for iOS feel; large flicks get clipped. |
+| `0` | 3.5 s | 1.9 s | Pure exponential, no asymmetry. |
+| `35` (default) | ≈3.3 s (−6%) | ≈1.7 s (−12%) | Small-flick tail noticeably trimmed, big flicks barely touched. |
+| `100` | 2.8 s (−20%) | 1.3 s (−30%) | Firmer — useful if default still feels long on small flicks. |
+| `200` | 2.5 s (−30%) | 1.0 s (−47%) | Aggressive; big flicks start to feel snappier too. |
+| `500`+ | 1.9 s or less | sub-second | Too much for an iOS feel; big flicks get clipped. |
 
-Start at `50` and raise in `25`–`50` steps until the smallest
-deliberate flick settles where you want it.  Values below `~4`
-truncate to zero internally, so don't bother going lower than `10`.
+If small flicks still coast too long: raise in `25`–`50` steps.  If
+big flicks feel dampened: lower, eventually to `0` for purely
+exponential decay.  Values below `~4` truncate to zero internally,
+so don't bother with `1`–`3`.
 
 ### Don't extend the tail too far
 

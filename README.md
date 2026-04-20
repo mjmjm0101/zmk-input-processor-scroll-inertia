@@ -5,6 +5,9 @@ iOS-style inertial scrolling for ZMK trackballs.
 *[日本語版 README はこちら / Japanese version available here](README_ja.md)*
 
 > **Stop accelerating. Start coasting.**
+
+![scroll demo](https://github.com/user-attachments/assets/fc8f89e9-8212-4a2c-80cf-3898f67d8bdf)
+
 >
 > Most ZMK trackball setups try to feel responsive by adding scroll
 > *acceleration* (move the ball faster → scroll more aggressively).

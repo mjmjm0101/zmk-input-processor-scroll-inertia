@@ -214,7 +214,6 @@ struct scroll_inertia_data {
     int32_t accum_y;
 
     int64_t inertia_start_time;
-    int32_t start_movement;
 
     /* Consecutive same-direction events absorbed in COASTING.  Reset
      * on any cross-axis or state change.  Hitting SUPPRESS_SAFETY_LIMIT
@@ -346,7 +345,6 @@ static void to_coasting(struct scroll_inertia_data *data,
      * Only clear coasting-specific fields and schedule the tick. */
     clear_coasting_fields(data);
     data->inertia_start_time = k_uptime_get();
-    data->start_movement = data->total_movement;
 
     /* Angle-invariant initial inertia strength:  in a single-axis
      * mode, boost the tracked axis's velocity to the full vector
@@ -429,13 +427,15 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
         data->vel_y = clamp_velocity(data->vel_y, cfg->limit_fp);
         data->total_movement += abs32(raw_value);
 
-        if (data->peak_vel_y != 0 &&
+        if (data->peak_vel_y != 0 && data->vel_y != 0 &&
             (data->vel_y > 0) != (data->peak_vel_y > 0)) {
             /* Direction reversal — reset direction-specific state so
              * the old direction's peak doesn't trigger false
              * deceleration or premature arming.  tracking_count set
              * to 1 (not 0) because this event belongs to the new
-             * direction's gesture. */
+             * direction's gesture.  The vel_y != 0 guard prevents a
+             * coincidental integer-truncation zero from being read as
+             * a "reversal to positive" and wiping a valid peak. */
             data->peak_vel_y = data->vel_y;
             data->decel_count = 0;
             data->total_movement = abs32(raw_value);
@@ -455,7 +455,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
         data->vel_x = clamp_velocity(data->vel_x, cfg->limit_fp);
         data->total_movement += abs32(raw_value);
 
-        if (data->peak_vel_x != 0 &&
+        if (data->peak_vel_x != 0 && data->vel_x != 0 &&
             (data->vel_x > 0) != (data->peak_vel_x > 0)) {
             data->peak_vel_x = data->vel_x;
             data->decel_count = 0;
@@ -526,7 +526,10 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
                                       const struct scroll_inertia_config *cfg,
                                       struct input_event *event,
                                       int32_t raw_value) {
-    int32_t ax = effective_axis(cfg);
+    /* classify_event routes cross-axis events to handle_cross_axis in
+     * single-axis modes, so any event reaching this handler is on a
+     * tracked axis — the raw event code is therefore sufficient to
+     * pick the inertia velocity. */
     bool is_y = (event->code == INPUT_REL_WHEEL);
     int32_t inertia_vel = is_y ? data->vel_y : data->vel_x;
     int32_t event_vel_fp = (int32_t)event->value << FP_SHIFT;
@@ -590,8 +593,12 @@ static void handle_cross_axis(struct scroll_inertia_data *data,
         if (data->cross_axis_accumulated >= cfg->move) {
             /* Vigorous cross-axis rolling — user is driving the
              * untracked axis.  Drop the silent coast so they regain
-             * direct control. */
+             * direct control.  to_tracking_from_coasting() clears
+             * pending_other, so re-stash this event's value so the
+             * new TRACKING gesture gets the magnitude contribution
+             * on the next tracked-axis event. */
             to_tracking_from_coasting(data);
+            data->pending_other = raw_value;
         }
         return;
     }
@@ -613,7 +620,7 @@ static void handle_cross_axis(struct scroll_inertia_data *data,
                       (int64_t)(*vel_cross) * cfg->blend) / 1000;
         *vel_cross = clamp_velocity(*vel_cross, cfg->limit_fp);
 
-        if (*peak_cross != 0 &&
+        if (*peak_cross != 0 && *vel_cross != 0 &&
             (*vel_cross > 0) != (*peak_cross > 0)) {
             *peak_cross = *vel_cross;
         } else if (abs32(*vel_cross) > abs32(*peak_cross)) {

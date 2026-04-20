@@ -226,8 +226,8 @@ behaviour):
 |---|---|---|
 | `gain` | `300` | How strongly each new event pulls the smoothed velocity (out of 1000).  Together with `blend`, this controls a moving average: `velocity = (event * gain + velocity * blend) / 1000`. |
 | `blend` | `700` | How much of the previous velocity is kept (out of 1000).  `gain + blend` should equal 1000. |
-| `start` | `75` | The peak **vector** velocity (in raw scroll units, `√(peak_x² + peak_y²)`) that a flick must reach before inertia is allowed to kick in.  Angle-invariant: a diagonal flick arms at the same overall strength as an axis-aligned one.  The default is intentionally on the conservative side so that small, deliberate scrolls don't trigger inertia — tune to taste. |
-| `move` | `135` | The total distance the ball must roll within a single flick before inertia is allowed to kick in.  Stops tiny stray motions from triggering it.  Same as `start`, the default is conservative; raise it if even casual scrolls trigger inertia, lower it if real flicks fail to. |
+| `start` | `40` | The peak **vector** velocity (in raw scroll units, `√(peak_x² + peak_y²)`) that a flick must reach before inertia is allowed to kick in.  Angle-invariant: a diagonal flick arms at the same overall strength as an axis-aligned one.  Raise it if casual scrolls keep triggering inertia. |
+| `move` | `80` | The total raw distance the ball must roll within a single flick before inertia is allowed to kick in.  Sums raw per-event magnitudes from both axes.  Stops tiny stray motions from triggering it.  Raise it if casual scrolls trigger inertia, lower it if real flicks fail to. |
 | `release` | `24` | If no events arrive for this many milliseconds, the ball is treated as released (~3 frames at 125 Hz). |
 | `fast` | `0` | Velocity boundary between the fast and mid decay zones.  `0` disables zoning (single curve). |
 | `decay-fast` | `990` | High-speed decay (out of 1000 per tick).  990 means `velocity *= 0.990` each tick. |
@@ -362,8 +362,8 @@ These two numbers decide *when* inertia activates.  The right values
 depend on your trackball CPI, your acceleration settings, and how hard
 you typically flick.
 
-- Start at `start = 75`, `move = 135` (the bundled defaults — calibrated
-  on a 1000 CPI PMW3610).
+- Start at `start = 40`, `move = 80` (the bundled defaults — calibrated
+  on a 1000 CPI PMW3610 against vector-magnitude arming).
 - If casual scrolls keep triggering inertia: raise both 1.5–2× until
   only deliberate flicks trigger it.
 - If real flicks aren't triggering: lower them by ~30%.

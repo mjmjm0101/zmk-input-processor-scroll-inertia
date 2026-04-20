@@ -52,16 +52,21 @@ properties:
   # ── Inertia start conditions ─────────────────────────────
   start:
     type: int
-    default: 75
+    default: 40
     description: |
-      Minimum EMA velocity (scroll units) to trigger inertia.
+      Minimum peak vector velocity (scroll units, fast_magnitude of
+      peak_x and peak_y) to trigger inertia.  Angle-invariant: a
+      diagonal flick crosses the threshold at the same overall
+      physical strength as an axis-aligned one.
   move:
     type: int
-    default: 135
+    default: 80
     description: |
       Minimum cumulative absolute movement (scroll units) within a
       gesture required to trigger inertia.  Prevents noise-triggered
-      activation.
+      activation.  Sums raw per-event magnitudes from both axes, so
+      a diagonal gesture accumulates naturally without a merge
+      inflation.
   release:
     type: int
     default: 24

@@ -1,5 +1,7 @@
 # zmk-input-processor-scroll-inertia
 
+[![test](https://github.com/mjmjm0101/zmk-input-processor-scroll-inertia/actions/workflows/test.yml/badge.svg)](https://github.com/mjmjm0101/zmk-input-processor-scroll-inertia/actions/workflows/test.yml)
+
 ZMKのトラックボール用、iOS風の慣性スクロールモジュール。
 
 > **加速じゃなくて滑らせよう。**

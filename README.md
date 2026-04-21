@@ -1,5 +1,7 @@
 # zmk-input-processor-scroll-inertia
 
+[![test](https://github.com/mjmjm0101/zmk-input-processor-scroll-inertia/actions/workflows/test.yml/badge.svg)](https://github.com/mjmjm0101/zmk-input-processor-scroll-inertia/actions/workflows/test.yml)
+
 iOS-style inertial scrolling for ZMK trackballs.
 
 *[日本語版 README はこちら / Japanese version available here](README_ja.md)*

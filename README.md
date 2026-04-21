@@ -260,7 +260,7 @@ hardware.  Out-of-range values will *not* be auto-corrected.
 
 | Property | Default | Recommended range | Description |
 |---|---|---|---|
-| `min-events` | `10` | `[3, 30]` | Minimum tracked-axis events required before arming is allowed.  Lets the EMA converge and filters transient spikes.  Too low arms on noise; too high prevents arming on short but deliberate flicks. |
+| `min-events` | `10` | `[3, 30]` | Minimum tracked-axis events required before arming is allowed.  Lets the EMA converge and filters transient spikes.  Too low arms on noise; too high prevents arming on short but deliberate flicks.  Automatically skipped when TRACKING is re-entered directly from COASTING, so rapid reversal flicks aren't blocked by this gate. |
 | `decel-samples` | `3` | `[1, 10]` | Consecutive sub-peak samples required to confirm deceleration before TRACKING → COASTING.  `1` triggers on any single dip; high values delay the transition. |
 | `decel-ratio` | `850` | `[700, 950]` | Deceleration threshold as permille of peak magnitude.  `850` = current must drop below 85% of peak.  Higher triggers on minor fluctuations; lower delays activation on gentle releases. |
 | `peak-decay` | `990` | `[950, 999]` | Peak velocity decay rate (permille per event).  Lets the peak drift down when velocity is below it, avoiding an inflated peak from a brief initial acceleration transient.  **Values ≥ 1000 are unsafe** — the peak can grow without bound. |
@@ -464,7 +464,7 @@ Transitions in detail:
 | From → To | Trigger |
 |---|---|
 | `IDLE → TRACKING` | First tracked-axis event. |
-| `TRACKING → COASTING` | Peak magnitude ≥ `start`, total movement ≥ `move`, ≥ `min-events`, then deceleration confirmed (`decel-samples` consecutive sub-peak samples).  Or the `stop_detect` fallback fires after `release` ms of silence with the same conditions. |
+| `TRACKING → COASTING` | Peak magnitude ≥ `start`, total movement ≥ `move`, ≥ `min-events` (skipped when TRACKING was entered directly from a prior COASTING), then deceleration confirmed (`decel-samples` consecutive sub-peak samples).  Or the `stop_detect` fallback fires after `release` ms of silence with the same conditions. |
 | `COASTING → TRACKING` | Reverse-direction event, cross-axis freeze break (cumulative cross-axis motion ≥ `move` while coasting, in single-axis modes), or `suppress-limit` consecutive same-direction absorbed events (suppress safety). |
 | `COASTING → IDLE` | Velocity < `stop`, `span` exceeded, or the bound layer turns off. |
 | *any* `→ IDLE` | Gesture timeout (no events for `gesture-timeout` ms), or stale-inertia detection (no events for two ticks while COASTING). |
@@ -490,7 +490,13 @@ Transitions in detail:
    `decel-samples` events in a row, the processor transitions to
    COASTING.  If no events arrive for `release` ms while armed, a
    fallback "stop detect" timer performs the same check for abrupt
-   releases.
+   releases.  **Post-coast shortcut:** if TRACKING was entered
+   directly from a prior COASTING (reverse flick, cross-axis break,
+   suppress safety, or stale-inertia reset), the `min-events` gate
+   is skipped on the next arm — the previous coast already proved
+   the gesture was committed, so short rapid reversal flicks don't
+   need to re-accumulate 10 events per direction.  `start` and
+   `move` still apply, so sub-threshold jitter can't arm.
 3. **COASTING.**  On entry the tracked axis's initial velocity is
    boosted to the full vector magnitude of the peak — so a diagonal
    flick coasts at the same strength as an axis-aligned flick of

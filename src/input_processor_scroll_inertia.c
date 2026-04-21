@@ -216,6 +216,15 @@ struct scroll_inertia_data {
     /* Timestamp of the last event (for gesture-timeout detection) */
     int64_t last_event_time;
 
+    /* Set true when leaving COASTING (reverse-flick, cross-axis break,
+     * suppress-limit, stale-inertia, or natural decay).  While true,
+     * the next arm skips the min-events gate — we've already witnessed
+     * a committed gesture, so the user's follow-up flick doesn't need
+     * to re-prove itself against the noise filter.  Cleared when the
+     * next arm consumes it (to_coasting) or when we fully reset via
+     * to_idle from any non-COASTING state. */
+    bool post_coast;
+
     /* Delayed work items */
     struct k_work_delayable stop_detect_work;
     struct k_work_delayable inertia_tick_work;
@@ -295,12 +304,18 @@ static void clear_coasting_fields(struct scroll_inertia_data *data) {
 }
 
 static void to_idle(struct scroll_inertia_data *data) {
-    if (data->state == SS_COASTING) {
+    bool was_coasting = (data->state == SS_COASTING);
+    if (was_coasting) {
         k_work_cancel_delayable(&data->inertia_tick_work);
     }
     k_work_cancel_delayable(&data->stop_detect_work);
     clear_tracking_fields(data);
     clear_coasting_fields(data);
+    /* Preserve the post-coast signal only when we're actually coming
+     * from a real coast (e.g., stale-inertia reset from a live coast).
+     * A to_idle from TRACKING or from IDLE itself means any prior
+     * post-coast credit is spent without arming — clear it. */
+    data->post_coast = was_coasting;
     data->state = SS_IDLE;
 }
 
@@ -316,6 +331,10 @@ static void to_tracking_from_coasting(struct scroll_inertia_data *data) {
     k_work_cancel_delayable(&data->inertia_tick_work);
     clear_coasting_fields(data);
     clear_tracking_fields(data);
+    /* We just witnessed a committed gesture; let the next arm skip
+     * the min-events gate so rapid reversal flicks can coast without
+     * accumulating 10 events per direction. */
+    data->post_coast = true;
     data->state = SS_TRACKING;
 }
 
@@ -325,6 +344,8 @@ static void to_coasting(struct scroll_inertia_data *data,
      * Only clear coasting-specific fields and schedule the tick. */
     clear_coasting_fields(data);
     data->inertia_start_time = k_uptime_get();
+    /* post-coast credit consumed by this arm. */
+    data->post_coast = false;
 
     /* Angle-invariant initial inertia strength:  in a single-axis
      * mode, boost the tracked axis's velocity to the full vector
@@ -457,8 +478,14 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
     int32_t peak_magnitude = fast_magnitude(data->peak_vel_x,
                                             data->peak_vel_y);
     bool vel_armed = (peak_magnitude >= cfg->start_fp);
+    /* post_coast bypasses min-events: after a real coast, the user's
+     * next flick doesn't need to re-prove itself against the noise
+     * filter.  start/move still apply, so sub-threshold jitter can't
+     * arm. */
+    bool events_ok = data->post_coast ||
+                     data->tracking_count >= cfg->min_events;
     bool armed = vel_armed && data->total_movement >= cfg->move
-                 && data->tracking_count >= cfg->min_events;
+                 && events_ok;
 
     /* Deceleration detection — magnitude-based for angle invariance.
      * A flick slowing down in X but steady in Y (or vice versa) is
@@ -778,7 +805,9 @@ static void stop_detect_handler(struct k_work *work) {
     bool vel_ok = (vel_magnitude >= cfg->start_fp);
     bool mov_ok = data->total_movement >= cfg->move;
 
-    if (vel_ok && mov_ok && data->tracking_count >= cfg->min_events) {
+    bool events_ok = data->post_coast ||
+                     data->tracking_count >= cfg->min_events;
+    if (vel_ok && mov_ok && events_ok) {
         to_coasting(data, cfg);
     } else {
         to_idle(data);

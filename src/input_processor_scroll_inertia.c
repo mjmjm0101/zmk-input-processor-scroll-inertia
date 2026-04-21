@@ -51,21 +51,14 @@
 #include <zmk/endpoints.h>
 #include <zmk/keymap.h>
 
-LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+#include "scroll_inertia_math.h"
 
-/* Fixed-point: 8-bit fractional part (×256) */
-#define FP_SHIFT 8
-#define FP_SCALE (1 << FP_SHIFT)
+LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /* Axis mode constants */
 #define AXIS_BOTH 0
 #define AXIS_Y    1
 #define AXIS_X    2
-
-/* Advanced-tuning constants are exposed as Devicetree properties
- * (decel-samples, gesture-timeout, decel-ratio, suppress-limit,
- * peak-decay, min-events).  Read via cfg-> throughout this file;
- * see dts/bindings/...yaml for defaults and recommended ranges. */
 
 /* ------------------------------------------------------------------
  * Concurrency model
@@ -105,45 +98,8 @@ enum event_class {
                      * later as idle keep-alives) */
 };
 
-/* ------------------------------------------------------------------ */
-/* Configuration (read from Devicetree at compile time)                */
-/* ------------------------------------------------------------------ */
-
-struct scroll_inertia_config {
-    int32_t gain;
-    int32_t blend;
-
-    int32_t start_fp;
-    int32_t move;
-    int32_t release_ms;
-
-    int32_t fast_fp;
-    int32_t decay_fast;
-    int32_t decay_slow;
-    int32_t slow_fp;
-    int32_t decay_tail;
-    int32_t friction_fp;
-    int32_t stop_fp;
-
-    int32_t scale;
-    int32_t scale_div;
-    int32_t limit_fp;
-    int32_t span_ms;
-    int32_t tick_ms;
-
-    int32_t axis;
-    int32_t layer;
-    int32_t swap_mod;
-    int32_t unlock_mod;     /* modifier bitmask that frees both axes */
-
-    /* Advanced tuning (see YAML binding for descriptions) */
-    int32_t min_events;
-    int32_t decel_samples;
-    int32_t decel_ratio;
-    int32_t peak_decay;
-    int32_t gesture_timeout_ms;
-    int32_t suppress_limit;
-};
+/* struct scroll_inertia_config lives in scroll_inertia_math.h so
+ * host-side tests can populate it directly without Zephyr headers. */
 
 /* ------------------------------------------------------------------ */
 /* Runtime state                                                       */
@@ -231,10 +187,8 @@ struct scroll_inertia_data {
 };
 
 /* ------------------------------------------------------------------ */
-/* Helpers                                                             */
+/* Helpers (Zephyr/ZMK-dependent — pure math lives in the header)      */
 /* ------------------------------------------------------------------ */
-
-static inline int32_t abs32(int32_t v) { return v < 0 ? -v : v; }
 
 /* Returns true if any of the configured swap-modifier bits are held. */
 static inline bool swap_active(const struct scroll_inertia_config *cfg) {
@@ -254,28 +208,28 @@ static inline int32_t effective_axis(const struct scroll_inertia_config *cfg) {
     return unlock_active(cfg) ? AXIS_BOTH : cfg->axis;
 }
 
-/* Integer approximation of sqrt(a² + b²).
- * Uses max(|a|,|b|) + min(|a|,|b|)/2  (max error ~12%). */
-static inline int32_t fast_magnitude(int32_t a, int32_t b) {
-    int32_t aa = abs32(a);
-    int32_t bb = abs32(b);
-    int32_t hi = aa > bb ? aa : bb;
-    int32_t lo = aa > bb ? bb : aa;
-    return hi + (lo >> 1);
+/* Full per-tracked-axis update: EMA + total_movement + peak, and on a
+ * direction reversal reset the gesture-wide counters (decel_count,
+ * total_movement, tracking_count).  Lives here (not in the math
+ * header) because it mutates scroll_inertia_data, which depends on
+ * Zephyr types.  Cross-axis updates don't reset gesture counters, so
+ * they call update_velocity_ema / update_peak from the header
+ * directly. */
+static inline void update_tracked_axis(struct scroll_inertia_data *data,
+                                       const struct scroll_inertia_config *cfg,
+                                       int32_t raw_value,
+                                       int32_t *vel, int32_t *peak) {
+    int32_t prev_peak = *peak;
+    *vel = update_velocity_ema(raw_value, *vel, cfg);
+    data->total_movement += abs32(raw_value);
+    bool reversed = peak_reversed(*vel, prev_peak);
+    *peak = update_peak(*vel, prev_peak, cfg);
+    if (reversed) {
+        data->decel_count = 0;
+        data->total_movement = abs32(raw_value);
+        data->tracking_count = 1;
+    }
 }
-
-static inline int32_t clamp_velocity(int32_t vel, int32_t limit_fp) {
-    if (vel > limit_fp)  return limit_fp;
-    if (vel < -limit_fp) return -limit_fp;
-    return vel;
-}
-
-/* Defensive guards against pathological DT values.  We don't try to
- * "auto-correct" every odd setting (that would silently mask user
- * mistakes); we only protect against the two values that would crash
- * or busy-loop: a zero divisor and a zero tick interval. */
-static inline int32_t safe_scale_div(int32_t v) { return v > 0 ? v : 1; }
-static inline int32_t safe_tick_ms(int32_t v)   { return v > 0 ? v : 1; }
 
 /* ------------------------------------------------------------------ */
 /* State transitions                                                   */
@@ -421,54 +375,17 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
 
     data->tracking_count++;
 
+    /* Direction reversal on the tracked axis resets gesture-wide state
+     * (decel_count, total_movement, tracking_count) so the old
+     * direction's peak can't trigger false deceleration or premature
+     * arming.  See update_tracked_axis for the reset logic. */
     if (is_y) {
-        int32_t delta_fp = raw_value << FP_SHIFT;
-        data->vel_y = ((int64_t)delta_fp * cfg->gain +
-                       (int64_t)data->vel_y * cfg->blend) / 1000;
-        data->vel_y = clamp_velocity(data->vel_y, cfg->limit_fp);
-        data->total_movement += abs32(raw_value);
-
-        if (data->peak_vel_y != 0 && data->vel_y != 0 &&
-            (data->vel_y > 0) != (data->peak_vel_y > 0)) {
-            /* Direction reversal — reset direction-specific state so
-             * the old direction's peak doesn't trigger false
-             * deceleration or premature arming.  tracking_count set
-             * to 1 (not 0) because this event belongs to the new
-             * direction's gesture.  The vel_y != 0 guard prevents a
-             * coincidental integer-truncation zero from being read as
-             * a "reversal to positive" and wiping a valid peak. */
-            data->peak_vel_y = data->vel_y;
-            data->decel_count = 0;
-            data->total_movement = abs32(raw_value);
-            data->tracking_count = 1;
-        } else if (abs32(data->vel_y) > abs32(data->peak_vel_y)) {
-            data->peak_vel_y = data->vel_y;
-        } else {
-            int32_t decayed = (int64_t)data->peak_vel_y * cfg->peak_decay / 1000;
-            data->peak_vel_y = abs32(decayed) > abs32(data->vel_y)
-                                   ? decayed : data->vel_y;
-        }
+        update_tracked_axis(data, cfg, raw_value,
+                            &data->vel_y, &data->peak_vel_y);
     }
     if (is_x) {
-        int32_t delta_fp = raw_value << FP_SHIFT;
-        data->vel_x = ((int64_t)delta_fp * cfg->gain +
-                       (int64_t)data->vel_x * cfg->blend) / 1000;
-        data->vel_x = clamp_velocity(data->vel_x, cfg->limit_fp);
-        data->total_movement += abs32(raw_value);
-
-        if (data->peak_vel_x != 0 && data->vel_x != 0 &&
-            (data->vel_x > 0) != (data->peak_vel_x > 0)) {
-            data->peak_vel_x = data->vel_x;
-            data->decel_count = 0;
-            data->total_movement = abs32(raw_value);
-            data->tracking_count = 1;
-        } else if (abs32(data->vel_x) > abs32(data->peak_vel_x)) {
-            data->peak_vel_x = data->vel_x;
-        } else {
-            int32_t decayed = (int64_t)data->peak_vel_x * cfg->peak_decay / 1000;
-            data->peak_vel_x = abs32(decayed) > abs32(data->vel_x)
-                                   ? decayed : data->vel_x;
-        }
+        update_tracked_axis(data, cfg, raw_value,
+                            &data->vel_x, &data->peak_vel_x);
     }
 
     /* Arming check — uses the vector magnitude of the per-axis peaks
@@ -539,7 +456,7 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
      * pick the inertia velocity. */
     bool is_y = (event->code == INPUT_REL_WHEEL);
     int32_t inertia_vel = is_y ? data->vel_y : data->vel_x;
-    int32_t event_vel_fp = (int32_t)event->value << FP_SHIFT;
+    int32_t event_vel_fp = event->value * FP_SCALE;
     bool same_dir = inertia_vel != 0 &&
                     (event->value > 0) == (inertia_vel > 0);
 
@@ -621,22 +538,9 @@ static void handle_cross_axis(struct scroll_inertia_data *data,
         int32_t *vel_cross  = (ax == AXIS_Y) ? &data->vel_x : &data->vel_y;
         int32_t *peak_cross = (ax == AXIS_Y) ? &data->peak_vel_x
                                              : &data->peak_vel_y;
-        int32_t delta_fp = (int32_t)raw_value << FP_SHIFT;
 
-        *vel_cross = ((int64_t)delta_fp * cfg->gain +
-                      (int64_t)(*vel_cross) * cfg->blend) / 1000;
-        *vel_cross = clamp_velocity(*vel_cross, cfg->limit_fp);
-
-        if (*peak_cross != 0 && *vel_cross != 0 &&
-            (*vel_cross > 0) != (*peak_cross > 0)) {
-            *peak_cross = *vel_cross;
-        } else if (abs32(*vel_cross) > abs32(*peak_cross)) {
-            *peak_cross = *vel_cross;
-        } else {
-            int32_t decayed = (int64_t)(*peak_cross) * cfg->peak_decay / 1000;
-            *peak_cross = abs32(decayed) > abs32(*vel_cross)
-                              ? decayed : *vel_cross;
-        }
+        *vel_cross  = update_velocity_ema(raw_value, *vel_cross, cfg);
+        *peak_cross = update_peak(*vel_cross, *peak_cross, cfg);
 
         data->tracking_count++;
         /* total_movement receives the raw cross-axis magnitude.  The
@@ -711,36 +615,10 @@ static void inertia_tick_handler(struct k_work *work) {
 
     int32_t ax = effective_axis(cfg);
 
-    /* Three-stage decay.  Set fast=0 and slow=0 with all three rates
-     * equal for a single-curve (iOS-style) decay. */
-    if (ax != AXIS_X) {
-        int32_t av = abs32(data->vel_y);
-        int32_t d = av > cfg->fast_fp ? cfg->decay_fast
-                  : av > cfg->slow_fp ? cfg->decay_slow
-                  :                     cfg->decay_tail;
-        data->vel_y = (int64_t)data->vel_y * d / 1000;
-        /* Additive (Coulomb) friction: constant absolute decel per
-         * tick.  Configured in permille of scroll units — friction=1000
-         * means 1 scroll unit subtracted per tick.  Grows in relative
-         * impact as velocity shrinks, which is the whole point. */
-        if (cfg->friction_fp > 0) {
-            if (data->vel_y > cfg->friction_fp)       data->vel_y -= cfg->friction_fp;
-            else if (data->vel_y < -cfg->friction_fp) data->vel_y += cfg->friction_fp;
-            else                                       data->vel_y = 0;
-        }
-    }
-    if (ax != AXIS_Y) {
-        int32_t av = abs32(data->vel_x);
-        int32_t d = av > cfg->fast_fp ? cfg->decay_fast
-                  : av > cfg->slow_fp ? cfg->decay_slow
-                  :                     cfg->decay_tail;
-        data->vel_x = (int64_t)data->vel_x * d / 1000;
-        if (cfg->friction_fp > 0) {
-            if (data->vel_x > cfg->friction_fp)       data->vel_x -= cfg->friction_fp;
-            else if (data->vel_x < -cfg->friction_fp) data->vel_x += cfg->friction_fp;
-            else                                       data->vel_x = 0;
-        }
-    }
+    /* Set fast=0 and slow=0 with all three rates equal for a
+     * single-curve (iOS-style) decay; see apply_decay. */
+    if (ax != AXIS_X) apply_decay(&data->vel_y, cfg);
+    if (ax != AXIS_Y) apply_decay(&data->vel_x, cfg);
 
     /* Stop gate */
     bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;
@@ -753,16 +631,8 @@ static void inertia_tick_handler(struct k_work *work) {
     /* Accumulate sub-unit values and emit integer scroll deltas */
     int16_t emit_x = 0, emit_y = 0;
     int32_t sdiv = safe_scale_div(cfg->scale_div);
-    if (ax != AXIS_X) {
-        data->accum_y += (int64_t)data->vel_y * cfg->scale / sdiv;
-        emit_y = (int16_t)(data->accum_y >> FP_SHIFT);
-        data->accum_y -= (int32_t)emit_y << FP_SHIFT;
-    }
-    if (ax != AXIS_Y) {
-        data->accum_x += (int64_t)data->vel_x * cfg->scale / sdiv;
-        emit_x = (int16_t)(data->accum_x >> FP_SHIFT);
-        data->accum_x -= (int32_t)emit_x << FP_SHIFT;
-    }
+    if (ax != AXIS_X) emit_y = accumulate_and_emit(data->vel_y, &data->accum_y, cfg, sdiv);
+    if (ax != AXIS_Y) emit_x = accumulate_and_emit(data->vel_x, &data->accum_x, cfg, sdiv);
 
     if (emit_x != 0 || emit_y != 0) {
         int16_t out_x = emit_x;
@@ -927,19 +797,19 @@ static struct zmk_input_processor_driver_api scroll_inertia_driver_api = {
     static const struct scroll_inertia_config scroll_inertia_config_##n = {   \
         .gain       = DT_INST_PROP(n, gain),                                  \
         .blend      = DT_INST_PROP(n, blend),                                 \
-        .start_fp   = DT_INST_PROP(n, start) << FP_SHIFT,                    \
+        .start_fp   = DT_INST_PROP(n, start) * FP_SCALE,                      \
         .move       = DT_INST_PROP(n, move),                                  \
         .release_ms = DT_INST_PROP(n, release),                               \
-        .fast_fp    = DT_INST_PROP(n, fast) << FP_SHIFT,                      \
+        .fast_fp    = DT_INST_PROP(n, fast) * FP_SCALE,                       \
         .decay_fast = DT_INST_PROP(n, decay_fast),                            \
         .decay_slow = DT_INST_PROP(n, decay_slow),                            \
-        .slow_fp    = DT_INST_PROP(n, slow) << FP_SHIFT,                      \
+        .slow_fp    = DT_INST_PROP(n, slow) * FP_SCALE,                       \
         .decay_tail = DT_INST_PROP(n, decay_tail),                            \
-        .friction_fp = (DT_INST_PROP(n, friction) << FP_SHIFT) / 1000,        \
-        .stop_fp    = DT_INST_PROP(n, stop) << FP_SHIFT,                      \
+        .friction_fp = DT_INST_PROP(n, friction) * FP_SCALE / 1000,           \
+        .stop_fp    = DT_INST_PROP(n, stop) * FP_SCALE,                       \
         .scale      = DT_INST_PROP(n, scale),                                 \
         .scale_div  = DT_INST_PROP(n, scale_div),                             \
-        .limit_fp   = DT_INST_PROP(n, limit) << FP_SHIFT,                    \
+        .limit_fp   = DT_INST_PROP(n, limit) * FP_SCALE,                      \
         .span_ms    = DT_INST_PROP(n, span),                                  \
         .tick_ms    = DT_INST_PROP(n, tick),                                   \
         .axis       = DT_INST_PROP(n, axis),                                   \

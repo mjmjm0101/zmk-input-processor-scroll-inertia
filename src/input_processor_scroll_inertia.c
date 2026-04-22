@@ -49,6 +49,26 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/input/input.h>
 
+/* This processor emits HID mouse scroll reports via
+ * zmk_hid_mouse_scroll_set / zmk_endpoints_send_mouse_report, and ZMK
+ * only compiles those (along with zmk_hid_get_explicit_mods and
+ * zmk_keymap_layer_active) on the central side of a split keyboard.
+ * If a DT node for this processor lands on a peripheral build we'd
+ * fail to link with undefined references to five symbols and no clear
+ * hint of the cause.  Fail loudly at compile time instead so the
+ * misconfiguration (peripheral-side processor node, or a shared
+ * overlay that forgets to scope the node to the central build) is
+ * obvious. */
+#if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#error "zmk,input-processor-scroll-inertia: central role required. " \
+       "This processor calls the ZMK mouse HID API (zmk_hid_mouse_*, " \
+       "zmk_endpoints_send_mouse_report) which is only compiled on the " \
+       "central side of a split keyboard.  Move the processor DT node " \
+       "(and any input-listener that references it) into a central-only " \
+       "overlay, or guard it with a per-side overlay so the peripheral " \
+       "build does not see it."
+#endif
+
 #include <drivers/input_processor.h>
 #include <zmk/hid.h>
 #include <zmk/endpoints.h>

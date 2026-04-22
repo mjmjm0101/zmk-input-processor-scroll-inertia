@@ -114,8 +114,24 @@ manifest:
 
 ### `*.conf`
 
-Nothing to add.
-The module turns itself on when it sees a matching node in your overlay.
+Nothing is strictly required — the module turns itself on when it sees a matching node in your overlay, and `CONFIG_ZMK_POINTING` is auto-selected by the module's Kconfig (it's needed for the mouse HID API this processor emits through).
+
+Two things worth knowing about:
+
+- **`CONFIG_ZMK_POINTING`** — required, automatically selected.
+  You don't need to set it yourself.
+- **`CONFIG_ZMK_POINTING_SMOOTH_SCROLLING=y`** — optional.
+  Enables the HID Resolution Multiplier so hosts that support it (recent macOS / Linux / Windows) interpret scroll output at higher resolution, giving noticeably smoother inertia tails.
+  If you enable it, you'll likely want to revisit `scale` / `scale-div` and `stop` in your overlay because the host is now interpreting the same integer scroll units at a finer granularity.
+  Recommended if your host supports it; strictly optional otherwise.
+
+#### Split keyboards
+
+On a split build this processor **must live on the central side**.
+The ZMK mouse HID (`zmk_hid_mouse_*`, `zmk_endpoints_send_mouse_report`) is only compiled for the central role, and the processor has no meaningful work to do on a peripheral (HID goes to the host from central).
+
+If a DT node for this processor lands on a peripheral build, the module fails the build at compile time with an explicit error pointing at the misconfiguration — it won't silently skip.
+Fix it by keeping the processor node (and any input-listener that references it) in a central-only overlay, or by scoping a shared overlay appropriately.
 
 ### `*.overlay`
 

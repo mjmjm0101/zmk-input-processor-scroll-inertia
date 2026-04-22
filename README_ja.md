@@ -122,8 +122,25 @@ manifest:
 
 ### `*.conf` ファイル
 
-何も追加する必要はありません。
+必須の追加はありません。
 オーバーレイに対応するDTノードがあれば、モジュールは自動で有効になります。
+`CONFIG_ZMK_POINTING` は本モジュールの Kconfig から自動で `select` されます（マウス HID API を叩くため必須）。
+
+覚えておくと良い設定が2つあります：
+
+- **`CONFIG_ZMK_POINTING`** — 必須ですが自動で有効化されます。ユーザーが書く必要はありません。
+- **`CONFIG_ZMK_POINTING_SMOOTH_SCROLLING=y`** — 任意。
+  HID Resolution Multiplier が有効化され、対応ホスト（比較的新しい macOS / Linux / Windows）側でスクロール出力を高解像度として解釈してくれるため、慣性の末尾がよりなめらかに感じられます。
+  有効化するなら、ホスト側の単位解釈が変わるのでオーバーレイの `scale` / `scale-div` と `stop` を見直したほうがいいです。
+  ホストが対応しているなら推奨、していないなら付けなくても問題ありません。
+
+#### 分割キーボードの場合
+
+分割ビルドでは、このプロセッサは **central 側に置く必要があります**。
+ZMK のマウス HID API（`zmk_hid_mouse_*`, `zmk_endpoints_send_mouse_report`）は central ロールでしか compile されず、peripheral 側にプロセッサを置いても HID 出力は central からしか出ないので意味がありません。
+
+DT ノードが peripheral ビルドに含まれると、モジュールはコンパイル時に明示的なエラーで停止します（silent skip はしません）。
+プロセッサの DT ノード（および参照している input-listener）を central 専用 overlay に置くか、共有 overlay を side-scope するかして解決してください。
 
 ### `*.overlay` ファイル
 

@@ -510,6 +510,19 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
  * clear in single-axis) and *after* (fall-through behaviour on a
  * reversal).
  *
+ * `axis_vel` points at the coasting component to mutate on a bump.
+ * `compare_vel` is the *reference coast speed* the event is compared
+ * against — |coast| for bumping, |coast|/2 for the clearly-weaker
+ * gate.  In single-axis modes the tracked axis already holds the
+ * vector magnitude after to_coasting, so the caller passes *axis_vel
+ * unchanged.  In AXIS_BOTH the per-axis component is smaller than the
+ * 2D coast speed, so the caller passes fast_magnitude(vel_y, vel_x)
+ * here — otherwise a diagonal coast would absorb weak events that
+ * would have passed through in single-axis for the same physical
+ * flick (pre-fix bug: mid-to-low speed diagonal coasts appeared to
+ * "freeze" direct input because the per-axis half threshold was too
+ * low to clear).
+ *
  * Returns true when the event should pass through downstream, false
  * when it was consumed (value zeroed).  suppress_limit → TRACKING
  * drop-back is handled internally.
@@ -521,28 +534,29 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
  * takes the same path, which is fine: it refreshes the coast rather
  * than fighting it.
  *
- * Below-inertia same-direction event has two sub-cases:
+ * Below-coast same-direction event has two sub-cases:
  *   (1) Within the handoff window, OR event velocity sits close to
- *       the current inertia — this is almost certainly the tail of
- *       the ball's natural post-flick deceleration (which decays more
+ *       the current coast — this is almost certainly the tail of the
+ *       ball's natural post-flick deceleration (which decays more
  *       slowly than the configured inertia, so its events stay within
- *       ~50% of axis_vel as the bump path tracks it).  Absorb to avoid
- *       double-emitting the same physical motion that inertia is
- *       already representing.
- *   (2) Post-handoff AND event velocity is clearly below half of
- *       inertia — a new weak user gesture, not ball tail.  Pass
- *       through so the user's own input drives visible scroll
- *       alongside the decaying tick; silently absorbing it would
- *       stall the screen at the late-coast sparse-emit regime.  We do
- *       not cancel the coast: the event is much weaker than the
- *       current inertia, so letting inertia finish out is natural. */
+ *       ~50% of compare_vel as the bump path tracks it).  Absorb to
+ *       avoid double-emitting the same physical motion that inertia
+ *       is already representing.
+ *   (2) Post-handoff AND event velocity is clearly below half of the
+ *       coast — a new weak user gesture, not ball tail.  Pass through
+ *       so the user's own input drives visible scroll alongside the
+ *       decaying tick; silently absorbing it would stall the screen
+ *       at the late-coast sparse-emit regime.  We do not cancel the
+ *       coast: the event is much weaker than the current inertia, so
+ *       letting inertia finish out is natural. */
 static bool coast_same_dir(struct scroll_inertia_data *data,
                            const struct scroll_inertia_config *cfg,
                            struct input_event *event,
-                           int32_t *axis_vel) {
+                           int32_t *axis_vel,
+                           int32_t compare_vel) {
     int32_t event_vel_fp = event->value * FP_SCALE;
 
-    if (abs32(event_vel_fp) > abs32(*axis_vel)) {
+    if (abs32(event_vel_fp) > abs32(compare_vel)) {
         *axis_vel = event_vel_fp;
         event->value = 0;
         data->suppress_count++;
@@ -555,7 +569,7 @@ static bool coast_same_dir(struct scroll_inertia_data *data,
     }
 
     int64_t coast_age = k_uptime_get() - data->inertia_start_time;
-    bool clearly_weaker = abs32(event_vel_fp) < (abs32(*axis_vel) >> 1);
+    bool clearly_weaker = abs32(event_vel_fp) < (abs32(compare_vel) >> 1);
     if (coast_age < cfg->handoff_ms || !clearly_weaker) {
         event->value = 0;
         data->suppress_count++;
@@ -591,7 +605,10 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
          * (interleaved tracked/cross events) don't reach the break
          * threshold through accumulated X alone. */
         data->cross_axis_accumulated = 0;
-        return coast_same_dir(data, cfg, event, axis_vel);
+        /* Single-axis: *axis_vel already holds the vector magnitude
+         * (to_coasting folds it in), so per-axis and magnitude-based
+         * comparison are equivalent here. */
+        return coast_same_dir(data, cfg, event, axis_vel, *axis_vel);
     }
 
     /* Reverse direction — user wants to scroll the other way.  Cancel
@@ -634,16 +651,33 @@ static bool handle_tracked_in_coasting_both(struct scroll_inertia_data *data,
 
     bool same_dir = (event->value > 0) == (*axis_vel > 0);
     if (same_dir) {
-        return coast_same_dir(data, cfg, event, axis_vel);
+        /* AXIS_BOTH: pass the vector magnitude as the comparison
+         * reference so the "clearly weaker" gate (event < coast/2)
+         * fires at the same physical speed as in single-axis mode.
+         * Using *axis_vel alone would shrink the threshold to the
+         * per-axis component, making a diagonal coast absorb weak
+         * events that a single-axis coast of equal physical speed
+         * would have passed through — the root cause of the axis=0
+         * freeze on mid-to-low-speed coasts. */
+        int32_t mag = fast_magnitude(data->vel_y, data->vel_x);
+        return coast_same_dir(data, cfg, event, axis_vel, mag);
     }
 
     /* Reverse on this axis.  Partial reset so the user regains direct
      * control on this axis; the other axis keeps coasting.  Only fall
      * back to TRACKING when both axes are dead — otherwise we'd kill a
-     * legitimate orthogonal coast. */
+     * legitimate orthogonal coast.
+     *
+     * suppress_count is cleared too: a reversal on one axis is a
+     * deliberate direction change in this gesture, so the same-dir
+     * absorption count from before the reversal no longer represents
+     * the user "rolling past a stale coast".  Leaving it accumulating
+     * means an otherwise-healthy mixed-direction pan could hit
+     * suppress-limit sooner than intended. */
     *axis_vel   = 0;
     *axis_peak  = 0;
     *axis_accum = 0;
+    data->suppress_count = 0;
 
     int32_t other_vel = is_y ? data->vel_x : data->vel_y;
     if (other_vel == 0) {

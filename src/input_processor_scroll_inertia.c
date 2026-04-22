@@ -181,6 +181,19 @@ struct scroll_inertia_data {
      * to_idle from any non-COASTING state. */
     bool post_coast;
 
+    /* Gesture commitment captured at to_coasting, in permille (0..1000).
+     * Used to scale the per-tick decay rate: weaker commitment makes
+     * the coast decay faster so a barely-armed flick doesn't sustain
+     * the high-velocity phase as long as a long, committed flick. */
+    int32_t commit_permille;
+
+    /* Initial coast velocity magnitude captured at to_coasting.  Used
+     * as the taper reference so the commit-based extra loss is at
+     * full strength near the top of the coast and tapers to zero as
+     * the velocity approaches stop_fp — the stopping behaviour stays
+     * identical to the unscaled path regardless of commitment. */
+    int32_t init_coast_vel;
+
     /* Delayed work items */
     struct k_work_delayable stop_detect_work;
     struct k_work_delayable inertia_tick_work;
@@ -301,31 +314,45 @@ static void to_coasting(struct scroll_inertia_data *data,
     /* post-coast credit consumed by this arm. */
     data->post_coast = false;
 
-    /* Angle-invariant initial inertia strength:  in a single-axis
-     * mode, boost the tracked axis's velocity to the full vector
-     * magnitude of the gesture's peak.  Without this, a 45° flick
-     * would coast weaker than an axis-aligned flick of the same
-     * physical vector strength (the tracked axis's own EMA only
-     * captures its own component).  Guarded by `peak_* != 0` on the
-     * tracked axis so a pure cross-axis gesture doesn't get
-     * unsolicited Y/X inertia. */
+    /* Angle-invariant initial inertia strength: in a single-axis mode,
+     * fold the vector magnitude of the gesture's *current* EMA into
+     * the tracked axis.  Using the current vel (not peak) means the
+     * inertia starts at the speed the user was actually seeing the
+     * moment release was detected, so there's no observable jump
+     * between the tracking output and the coast.  Angle invariance
+     * still holds because fast_magnitude of (vel_x, vel_y) is
+     * symmetric — a 45° flick and an axis-aligned flick of the same
+     * physical strength both land on the same cur_mag here.  Guarded
+     * by `peak_* != 0` on the tracked axis so a pure cross-axis
+     * gesture doesn't get unsolicited Y/X inertia. */
     int32_t ax = effective_axis(cfg);
-    int32_t peak_mag = fast_magnitude(data->peak_vel_x, data->peak_vel_y);
+    int32_t cur_mag = fast_magnitude(data->vel_x, data->vel_y);
     if (ax == AXIS_Y && data->peak_vel_y != 0) {
         int32_t sign = (data->peak_vel_y > 0) ? 1 : -1;
-        data->vel_y = clamp_velocity(peak_mag * sign, cfg->limit_fp);
+        data->vel_y = clamp_velocity(cur_mag * sign, cfg->limit_fp);
     } else if (ax == AXIS_X && data->peak_vel_x != 0) {
         int32_t sign = (data->peak_vel_x > 0) ? 1 : -1;
-        data->vel_x = clamp_velocity(peak_mag * sign, cfg->limit_fp);
+        data->vel_x = clamp_velocity(cur_mag * sign, cfg->limit_fp);
     }
     /* AXIS_BOTH keeps per-axis vel_y and vel_x as they are — the user
      * wants diagonal coasting in that mode, not magnitude-folded Y. */
 
+    /* Commitment factor (saturation curve): 500 permille right at the
+     * arming threshold (total_movement == move), asymptotically
+     * approaching 1000 as the gesture grows.  Used by the tick handler
+     * to scale the decay rate; the taper below confines the effect to
+     * the upper speed band so the tail still converges at the unscaled
+     * rate. */
+    data->commit_permille = (int64_t)data->total_movement * 1000
+                            / (data->total_movement + cfg->move);
+    data->init_coast_vel = cur_mag;
+
     k_work_cancel_delayable(&data->stop_detect_work);
     data->state = SS_COASTING;
 
-    LOG_DBG("Inertia start  vel_y=%d vel_x=%d  mov=%d",
-            data->vel_y, data->vel_x, data->total_movement);
+    LOG_DBG("Inertia start  vel_y=%d vel_x=%d  mov=%d  commit=%d",
+            data->vel_y, data->vel_x, data->total_movement,
+            data->commit_permille);
 
     k_work_schedule(&data->inertia_tick_work,
                     K_MSEC(safe_tick_ms(cfg->tick_ms)));
@@ -649,9 +676,17 @@ static void inertia_tick_handler(struct k_work *work) {
     int32_t ax = effective_axis(cfg);
 
     /* Set fast=0 and slow=0 with all three rates equal for a
-     * single-curve (iOS-style) decay; see apply_decay. */
-    if (ax != AXIS_X) apply_decay(&data->vel_y, cfg);
-    if (ax != AXIS_Y) apply_decay(&data->vel_x, cfg);
+     * single-curve (iOS-style) decay; see apply_decay.  commit_permille
+     * and init_coast_vel (both captured at to_coasting) shape a
+     * velocity-tapered extra loss so weakly-committed gestures shed
+     * their upper-speed phase quickly while the tail converges at the
+     * unscaled baseline rate. */
+    if (ax != AXIS_X) apply_decay(&data->vel_y, cfg,
+                                  data->commit_permille,
+                                  data->init_coast_vel);
+    if (ax != AXIS_Y) apply_decay(&data->vel_x, cfg,
+                                  data->commit_permille,
+                                  data->init_coast_vel);
 
     /* Stop gate */
     bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;

@@ -19,6 +19,8 @@ iOS-style inertial scrolling for ZMK trackballs.
 > alone, do that first.  It's not just a feature — it's the missing
 > piece of the trackball experience.
 
+*Note: the inertia feel has been smoothed out compared to v0.5.x and earlier.*
+
 ---
 
 ## What this module is

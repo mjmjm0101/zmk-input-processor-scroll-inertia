@@ -127,13 +127,44 @@ static inline int32_t update_peak(int32_t vel, int32_t peak,
 
 /* One tick of velocity decay: three-stage multiplicative (decay_fast /
  * decay_slow / decay_tail selected by the fast_fp and slow_fp
- * boundaries), then additive Coulomb friction. */
+ * boundaries), then additive Coulomb friction.
+ *
+ * `commit_permille` (0..1000) and `init_vel` together shape an extra,
+ * velocity-tapered loss on top of the baseline multiplicative decay.
+ *
+ *     taper = max(0, |vel| - stop_fp) / max(init_vel - stop_fp, 1)
+ *     full_extra = base_loss × (1000 - commit_permille) / commit_permille
+ *     scaled_loss = base_loss + full_extra × taper
+ *
+ * Near the top of the coast (|vel| ≈ init_vel) taper ≈ 1, so weakly-
+ * committed flicks burn through the upper speed band quickly.  As vel
+ * approaches stop_fp, taper → 0 and the loss returns to the baseline
+ * decay rate — stopping behaviour stays identical regardless of
+ * commitment, only the upper/middle speed bands shrink.
+ *
+ * Pass commit_permille = 1000 (or init_vel = 0) for the unscaled
+ * baseline decay (host tests and AXIS_BOTH fallback). */
 static inline void apply_decay(int32_t *vel,
-                               const struct scroll_inertia_config *cfg) {
+                               const struct scroll_inertia_config *cfg,
+                               int32_t commit_permille,
+                               int32_t init_vel) {
     int32_t av = abs32(*vel);
     int32_t d = av > cfg->fast_fp ? cfg->decay_fast
               : av > cfg->slow_fp ? cfg->decay_slow
               :                     cfg->decay_tail;
+    if (commit_permille > 0 && commit_permille < 1000 && init_vel > cfg->stop_fp) {
+        int32_t vel_above = av > cfg->stop_fp ? av - cfg->stop_fp : 0;
+        int32_t init_above = init_vel - cfg->stop_fp;
+        int32_t taper = (int64_t)vel_above * 1000 / init_above;
+        if (taper > 1000) taper = 1000;
+        int32_t base_loss = 1000 - d;
+        int32_t full_extra = (int64_t)base_loss * (1000 - commit_permille)
+                             / commit_permille;
+        int32_t extra = (int64_t)full_extra * taper / 1000;
+        int32_t scaled_loss = base_loss + extra;
+        if (scaled_loss > 1000) scaled_loss = 1000;
+        d = 1000 - scaled_loss;
+    }
     *vel = (int64_t)(*vel) * d / 1000;
     if (cfg->friction_fp > 0) {
         if (*vel > cfg->friction_fp)       *vel -= cfg->friction_fp;

@@ -187,11 +187,11 @@ static void test_apply_decay(void) {
 
     /* With fast=slow=0, any nonzero av uses decay_fast=990. */
     int32_t vel = 25600;   /* 100 scroll units */
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("decay pos", vel, 25344);
 
     vel = -25600;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("decay neg", vel, -25344);
 
     /* Friction bites below threshold. */
@@ -200,16 +200,16 @@ static void test_apply_decay(void) {
     cfg.decay_tail = 1000;
     cfg.friction_fp = 8;
     vel = 5;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("friction clamps small +", vel, 0);
     vel = -5;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("friction clamps small -", vel, 0);
     vel = 100;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("friction subtracts +", vel, 92);
     vel = -100;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("friction subtracts -", vel, -92);
 
     /* Three-stage boundaries. */
@@ -220,14 +220,56 @@ static void test_apply_decay(void) {
     cfg.decay_slow  = 950;
     cfg.decay_tail  = 990;
     vel = 2000;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("fast zone", vel, 1800);   /* 2000*900/1000 */
     vel = 500;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("slow zone", vel, 475);    /* 500*950/1000 */
     vel = 50;
-    apply_decay(&vel, &cfg);
+    apply_decay(&vel, &cfg, 1000, 0);
     ASSERT_EQ("tail zone", vel, 49);     /* 50*990/1000 = 49 */
+
+    /* Commit + taper: with vel == init_vel, taper = 1 (full scaling).
+     * base_loss = 10 (decay_fast=990) → full_extra = 10 * (1000-500)/500 = 10
+     * → scaled_loss = 10 + 10 = 20 → rate = 980 → vel = 10000*980/1000 */
+    cfg = default_cfg();
+    cfg.friction_fp = 0;
+    vel = 10000;
+    apply_decay(&vel, &cfg, 500, 10000);
+    ASSERT_EQ("taper 1 at commit=500", vel, 9800);
+
+    vel = 10000;
+    apply_decay(&vel, &cfg, 250, 10000);
+    ASSERT_EQ("taper 1 at commit=250", vel, 9600); /* rate 960 */
+
+    /* commit_permille == 1000 reproduces unscaled decay regardless of init. */
+    vel = 10000;
+    apply_decay(&vel, &cfg, 1000, 10000);
+    ASSERT_EQ("commit 1000 == unscaled", vel, 9900);
+
+    /* init_vel=0 also falls back to unscaled (no taper reference). */
+    vel = 10000;
+    apply_decay(&vel, &cfg, 500, 0);
+    ASSERT_EQ("init_vel=0 == unscaled", vel, 9900);
+
+    /* Taper = 0 when |vel| <= stop_fp: no extra loss regardless of commit. */
+    vel = cfg.stop_fp;
+    apply_decay(&vel, &cfg, 250, 10000);
+    ASSERT_EQ("taper 0 at stop_fp", vel, cfg.stop_fp * 990 / 1000);
+
+    /* Taper ≈ 0.5 midway between stop_fp and init_vel.
+     * init_above = 10000 - 1792 = 8208; pick vel so vel_above = 4104 → taper 500.
+     * full_extra = 10 * 500/500 = 10; extra = 10 * 500/1000 = 5
+     * scaled_loss = 15 → rate 985 → 5896 * 985/1000 = 5807 (int). */
+    vel = 5896;
+    apply_decay(&vel, &cfg, 500, 10000);
+    ASSERT_EQ("taper 0.5 blends loss", vel, 5807);
+
+    /* Extreme-low commit should clamp (scaled_loss capped at 1000),
+     * never yielding a negative rate. */
+    vel = 10000;
+    apply_decay(&vel, &cfg, 1, 10000);
+    ASSERT_TRUE("commit clamp keeps vel in-range", vel >= 0 && vel <= 10000);
 }
 
 /* ------------------------------------------------------------------ */

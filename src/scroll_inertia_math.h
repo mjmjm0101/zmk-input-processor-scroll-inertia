@@ -125,51 +125,71 @@ static inline int32_t update_peak(int32_t vel, int32_t peak,
     return abs32(decayed) > abs32(vel) ? decayed : vel;
 }
 
-/* One tick of velocity decay: three-stage multiplicative (decay_fast /
- * decay_slow / decay_tail selected by the fast_fp and slow_fp
- * boundaries), then additive Coulomb friction.
+/* Three-stage multiplicative decay rate: select decay_fast /
+ * decay_slow / decay_tail based on the fast_fp and slow_fp boundaries.
+ * The `speed` argument is `|vel|` in the 1D case and vector magnitude
+ * in the 2D case — both are "speed in fixed-point" as far as the zone
+ * thresholds are concerned. */
+static inline int32_t select_decay_rate(int32_t speed,
+                                        const struct scroll_inertia_config *cfg) {
+    return speed > cfg->fast_fp ? cfg->decay_fast
+         : speed > cfg->slow_fp ? cfg->decay_slow
+         :                        cfg->decay_tail;
+}
+
+/* Scale the per-tick decay rate by the commit-based taper.  Shared by
+ * apply_decay (1D) and apply_decay_2d (2D) — both feed in the current
+ * speed (|vel| or magnitude) and the initial speed captured at
+ * to_coasting, and the formula is identical:
  *
- * `commit_permille` (0..1000) and `init_vel` together shape an extra,
- * velocity-tapered loss on top of the baseline multiplicative decay.
- *
- *     taper_lin = max(0, |vel| - stop_fp) / max(init_vel - stop_fp, 1)
+ *     taper_lin = max(0, speed - stop_fp) / max(init_speed - stop_fp, 1)
  *     taper     = taper_lin²   (weights the effect toward the top)
  *     full_extra = base_loss × (1000 - commit_permille) / commit_permille
  *     scaled_loss = base_loss + full_extra × taper
  *
  * The squared taper concentrates the commit-based acceleration in the
- * upper speed band: at the top of the coast (|vel| ≈ init_vel) taper
+ * upper speed band: at the top of the coast (speed ≈ init_speed) taper
  * ≈ 1 and weakly-committed flicks burn through the initial phase
  * quickly; in the mid speed band the effect drops off steeply so the
  * coast retains the velocity it needs for smooth accumulate_and_emit
- * output; as vel approaches stop_fp, taper → 0 and the loss returns
+ * output; as speed approaches stop_fp, taper → 0 and the loss returns
  * to the baseline rate.  Stopping behaviour stays identical
  * regardless of commitment — only the upper band shrinks.
  *
- * Pass commit_permille = 1000 (or init_vel = 0) for the unscaled
- * baseline decay (host tests and AXIS_BOTH fallback). */
+ * Pass commit_permille = 1000 (or init_speed = 0) to short-circuit to
+ * the unscaled baseline decay (host tests and AXIS_BOTH fallback). */
+static inline int32_t apply_commit_taper(int32_t d, int32_t speed,
+                                         int32_t init_speed,
+                                         int32_t commit_permille,
+                                         const struct scroll_inertia_config *cfg) {
+    if (!(commit_permille > 0 && commit_permille < 1000 &&
+          init_speed > cfg->stop_fp)) {
+        return d;
+    }
+    int32_t vel_above = speed > cfg->stop_fp ? speed - cfg->stop_fp : 0;
+    int32_t init_above = init_speed - cfg->stop_fp;
+    int32_t taper = (int64_t)vel_above * 1000 / init_above;
+    if (taper > 1000) taper = 1000;
+    taper = (int64_t)taper * taper / 1000;
+    int32_t base_loss = 1000 - d;
+    int32_t full_extra = (int64_t)base_loss * (1000 - commit_permille)
+                         / commit_permille;
+    int32_t extra = (int64_t)full_extra * taper / 1000;
+    int32_t scaled_loss = base_loss + extra;
+    if (scaled_loss > 1000) scaled_loss = 1000;
+    return 1000 - scaled_loss;
+}
+
+/* One tick of velocity decay: three-stage multiplicative rate
+ * (select_decay_rate) optionally scaled by the commit taper
+ * (apply_commit_taper), then additive Coulomb friction. */
 static inline void apply_decay(int32_t *vel,
                                const struct scroll_inertia_config *cfg,
                                int32_t commit_permille,
                                int32_t init_vel) {
     int32_t av = abs32(*vel);
-    int32_t d = av > cfg->fast_fp ? cfg->decay_fast
-              : av > cfg->slow_fp ? cfg->decay_slow
-              :                     cfg->decay_tail;
-    if (commit_permille > 0 && commit_permille < 1000 && init_vel > cfg->stop_fp) {
-        int32_t vel_above = av > cfg->stop_fp ? av - cfg->stop_fp : 0;
-        int32_t init_above = init_vel - cfg->stop_fp;
-        int32_t taper = (int64_t)vel_above * 1000 / init_above;
-        if (taper > 1000) taper = 1000;
-        taper = (int64_t)taper * taper / 1000;
-        int32_t base_loss = 1000 - d;
-        int32_t full_extra = (int64_t)base_loss * (1000 - commit_permille)
-                             / commit_permille;
-        int32_t extra = (int64_t)full_extra * taper / 1000;
-        int32_t scaled_loss = base_loss + extra;
-        if (scaled_loss > 1000) scaled_loss = 1000;
-        d = 1000 - scaled_loss;
-    }
+    int32_t d = select_decay_rate(av, cfg);
+    d = apply_commit_taper(d, av, init_vel, commit_permille, cfg);
     *vel = (int64_t)(*vel) * d / 1000;
     if (cfg->friction_fp > 0) {
         if (*vel > cfg->friction_fp)       *vel -= cfg->friction_fp;
@@ -206,23 +226,8 @@ static inline void apply_decay_2d(int32_t *vel_y, int32_t *vel_x,
     int32_t mag = fast_magnitude(*vel_y, *vel_x);
     if (mag == 0) return;
 
-    int32_t d = mag > cfg->fast_fp ? cfg->decay_fast
-              : mag > cfg->slow_fp ? cfg->decay_slow
-              :                      cfg->decay_tail;
-    if (commit_permille > 0 && commit_permille < 1000 && init_mag > cfg->stop_fp) {
-        int32_t vel_above = mag > cfg->stop_fp ? mag - cfg->stop_fp : 0;
-        int32_t init_above = init_mag - cfg->stop_fp;
-        int32_t taper = (int64_t)vel_above * 1000 / init_above;
-        if (taper > 1000) taper = 1000;
-        taper = (int64_t)taper * taper / 1000;
-        int32_t base_loss = 1000 - d;
-        int32_t full_extra = (int64_t)base_loss * (1000 - commit_permille)
-                             / commit_permille;
-        int32_t extra = (int64_t)full_extra * taper / 1000;
-        int32_t scaled_loss = base_loss + extra;
-        if (scaled_loss > 1000) scaled_loss = 1000;
-        d = 1000 - scaled_loss;
-    }
+    int32_t d = select_decay_rate(mag, cfg);
+    d = apply_commit_taper(d, mag, init_mag, commit_permille, cfg);
 
     int32_t new_mag = (int64_t)mag * d / 1000;
     if (cfg->friction_fp > 0) {

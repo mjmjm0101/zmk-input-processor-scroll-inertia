@@ -503,12 +503,17 @@ Transitions in detail:
    need to re-accumulate 10 events per direction.  `start` and
    `move` still apply, so sub-threshold jitter can't arm.
 3. **COASTING.**  On entry the tracked axis's initial velocity is
-   boosted to the full vector magnitude of the peak — so a diagonal
+   reseeded to the current vector-magnitude EMA — so a diagonal
    flick coasts at the same strength as an axis-aligned flick of
    the same physical vector strength, not just the tracked axis's
-   component.  A timer fires every `tick` ms.  Each tick multiplies
-   velocity by the configured decay, subtracts friction, accumulates,
-   and emits whole scroll units to the host.  Tracking-axis events
+   component.  Using the *current* EMA rather than the peak means
+   the coast picks up from the speed the user was actually seeing
+   at release, with no observable acceleration jump.  A timer fires
+   every `tick` ms.  Each tick multiplies velocity by the configured
+   decay (slightly accelerated in the upper-speed band for gestures
+   that only just cleared `move`, so weakly-committed flicks don't
+   sustain the high-speed phase as long as committed ones), subtracts
+   friction, accumulates, and emits whole scroll units to the host.  Tracking-axis events
    that arrive in the same direction are absorbed (possibly bumping
    velocity to match the ball's actual motion); opposite-direction
    events cancel inertia back to TRACKING.  Coasting ends when

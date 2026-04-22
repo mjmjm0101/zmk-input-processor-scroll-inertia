@@ -114,10 +114,13 @@ struct scroll_inertia_data {
 
     /* Velocity EMA in fixed-point (×256).  Updated each event from
      * the raw delta in TRACKING.  Inherited into COASTING (where the
-     * tick handler decays it) and, in single-axis mode, boosted to
-     * the vector-magnitude peak on the TRACKING → COASTING
-     * transition so diagonal flicks coast at full strength.
-     * Cleared when TRACKING starts. */
+     * tick handler decays it) and, in single-axis mode, reseeded to
+     * the current vector-magnitude EMA on the TRACKING → COASTING
+     * transition so diagonal flicks coast at the same strength as
+     * axis-aligned flicks of the same physical vector magnitude.
+     * Using the current EMA (not the peak) keeps the coast
+     * continuous with the tracking output — no acceleration jump
+     * at handoff.  Cleared when TRACKING starts. */
     int32_t vel_x;
     int32_t vel_y;
 

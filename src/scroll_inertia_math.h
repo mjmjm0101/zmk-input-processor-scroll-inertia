@@ -132,15 +132,19 @@ static inline int32_t update_peak(int32_t vel, int32_t peak,
  * `commit_permille` (0..1000) and `init_vel` together shape an extra,
  * velocity-tapered loss on top of the baseline multiplicative decay.
  *
- *     taper = max(0, |vel| - stop_fp) / max(init_vel - stop_fp, 1)
+ *     taper_lin = max(0, |vel| - stop_fp) / max(init_vel - stop_fp, 1)
+ *     taper     = taper_lin²   (weights the effect toward the top)
  *     full_extra = base_loss × (1000 - commit_permille) / commit_permille
  *     scaled_loss = base_loss + full_extra × taper
  *
- * Near the top of the coast (|vel| ≈ init_vel) taper ≈ 1, so weakly-
- * committed flicks burn through the upper speed band quickly.  As vel
- * approaches stop_fp, taper → 0 and the loss returns to the baseline
- * decay rate — stopping behaviour stays identical regardless of
- * commitment, only the upper/middle speed bands shrink.
+ * The squared taper concentrates the commit-based acceleration in the
+ * upper speed band: at the top of the coast (|vel| ≈ init_vel) taper
+ * ≈ 1 and weakly-committed flicks burn through the initial phase
+ * quickly; in the mid speed band the effect drops off steeply so the
+ * coast retains the velocity it needs for smooth accumulate_and_emit
+ * output; as vel approaches stop_fp, taper → 0 and the loss returns
+ * to the baseline rate.  Stopping behaviour stays identical
+ * regardless of commitment — only the upper band shrinks.
  *
  * Pass commit_permille = 1000 (or init_vel = 0) for the unscaled
  * baseline decay (host tests and AXIS_BOTH fallback). */
@@ -157,6 +161,7 @@ static inline void apply_decay(int32_t *vel,
         int32_t init_above = init_vel - cfg->stop_fp;
         int32_t taper = (int64_t)vel_above * 1000 / init_above;
         if (taper > 1000) taper = 1000;
+        taper = (int64_t)taper * taper / 1000;
         int32_t base_loss = 1000 - d;
         int32_t full_extra = (int64_t)base_loss * (1000 - commit_permille)
                              / commit_permille;

@@ -257,13 +257,14 @@ static void test_apply_decay(void) {
     apply_decay(&vel, &cfg, 250, 10000);
     ASSERT_EQ("taper 0 at stop_fp", vel, cfg.stop_fp * 990 / 1000);
 
-    /* Taper ≈ 0.5 midway between stop_fp and init_vel.
-     * init_above = 10000 - 1792 = 8208; pick vel so vel_above = 4104 → taper 500.
-     * full_extra = 10 * 500/500 = 10; extra = 10 * 500/1000 = 5
-     * scaled_loss = 15 → rate 985 → 5896 * 985/1000 = 5807 (int). */
+    /* Squared taper ≈ 0.25 midway between stop_fp and init_vel.
+     * init_above = 10000 - 1792 = 8208; pick vel so vel_above = 4104 →
+     * linear taper = 500 → squared taper = 250.
+     * full_extra = 10 * 500/500 = 10; extra = 10 * 250/1000 = 2
+     * scaled_loss = 12 → rate 988 → 5896 * 988/1000 = 5825 (int). */
     vel = 5896;
     apply_decay(&vel, &cfg, 500, 10000);
-    ASSERT_EQ("taper 0.5 blends loss", vel, 5807);
+    ASSERT_EQ("squared taper at mid-vel", vel, 5825);
 
     /* Extreme-low commit should clamp (scaled_loss capped at 1000),
      * never yielding a negative rate. */

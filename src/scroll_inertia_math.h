@@ -178,6 +178,66 @@ static inline void apply_decay(int32_t *vel,
     }
 }
 
+/* 2D magnitude-based decay for AXIS_BOTH coasting.  Same decay and
+ * friction model as apply_decay, but driven by the vector magnitude of
+ * (vel_y, vel_x) so diagonal coasts behave the same as axis-aligned
+ * ones of the same physical speed.
+ *
+ * The per-axis apply_decay path is already correct for single-axis
+ * mode (vel == magnitude in 1D) and stays in use there; this function
+ * is only called from the AXIS_BOTH branch of the tick handler.
+ *
+ * Differences from the per-axis model a user would observe on a
+ * diagonal:
+ *   - Friction is a single Coulomb subtraction on the magnitude, so
+ *     the effective deceleration along the direction of motion is
+ *     friction_fp (not √2 × friction_fp as it is in per-axis).
+ *   - Zone boundaries (fast_fp, slow_fp) are crossed based on the
+ *     vector magnitude, so a 45° flick transitions zones at the same
+ *     physical speed as an axis-aligned one.
+ *
+ * Multiplicative decay was already symmetric (scaling both axes by
+ * the same factor scales the magnitude by that factor) so no
+ * perceptual change there. */
+static inline void apply_decay_2d(int32_t *vel_y, int32_t *vel_x,
+                                  const struct scroll_inertia_config *cfg,
+                                  int32_t commit_permille,
+                                  int32_t init_mag) {
+    int32_t mag = fast_magnitude(*vel_y, *vel_x);
+    if (mag == 0) return;
+
+    int32_t d = mag > cfg->fast_fp ? cfg->decay_fast
+              : mag > cfg->slow_fp ? cfg->decay_slow
+              :                      cfg->decay_tail;
+    if (commit_permille > 0 && commit_permille < 1000 && init_mag > cfg->stop_fp) {
+        int32_t vel_above = mag > cfg->stop_fp ? mag - cfg->stop_fp : 0;
+        int32_t init_above = init_mag - cfg->stop_fp;
+        int32_t taper = (int64_t)vel_above * 1000 / init_above;
+        if (taper > 1000) taper = 1000;
+        taper = (int64_t)taper * taper / 1000;
+        int32_t base_loss = 1000 - d;
+        int32_t full_extra = (int64_t)base_loss * (1000 - commit_permille)
+                             / commit_permille;
+        int32_t extra = (int64_t)full_extra * taper / 1000;
+        int32_t scaled_loss = base_loss + extra;
+        if (scaled_loss > 1000) scaled_loss = 1000;
+        d = 1000 - scaled_loss;
+    }
+
+    int32_t new_mag = (int64_t)mag * d / 1000;
+    if (cfg->friction_fp > 0) {
+        new_mag = new_mag > cfg->friction_fp ? new_mag - cfg->friction_fp : 0;
+    }
+
+    if (new_mag == 0) {
+        *vel_y = 0;
+        *vel_x = 0;
+        return;
+    }
+    *vel_y = (int64_t)(*vel_y) * new_mag / mag;
+    *vel_x = (int64_t)(*vel_x) * new_mag / mag;
+}
+
 /* Accumulate sub-unit velocity into *accum and emit the whole-unit
  * delta, keeping the fractional remainder in *accum so slow tails
  * still tick out discrete scroll events. */

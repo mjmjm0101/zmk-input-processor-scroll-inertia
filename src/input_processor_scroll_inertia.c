@@ -204,6 +204,14 @@ struct scroll_inertia_data {
     int32_t init_vel_y;
     int32_t init_vel_x;
 
+    /* Initial coast vector magnitude captured at to_coasting (after
+     * the AXIS_BOTH clamp).  Used as the taper reference in
+     * apply_decay_2d.  Single-axis modes ignore this and keep using
+     * init_vel_*; the 1D decay path is equivalent to the 2D one when
+     * one axis is zero, so there's no reason to force them through
+     * the magnitude function. */
+    int32_t init_mag;
+
     /* Delayed work items */
     struct k_work_delayable stop_detect_work;
     struct k_work_delayable inertia_tick_work;
@@ -367,6 +375,8 @@ static void to_coasting(struct scroll_inertia_data *data,
      * 1.0 on each live axis regardless of AXIS_BOTH vs single-axis. */
     data->init_vel_y = abs32(data->vel_y);
     data->init_vel_x = abs32(data->vel_x);
+    /* Magnitude taper reference for apply_decay_2d (AXIS_BOTH only). */
+    data->init_mag = fast_magnitude(data->vel_y, data->vel_x);
 
     k_work_cancel_delayable(&data->stop_detect_work);
     data->state = SS_COASTING;
@@ -774,21 +784,40 @@ static void inertia_tick_handler(struct k_work *work) {
 
     /* Set fast=0 and slow=0 with all three rates equal for a
      * single-curve (iOS-style) decay; see apply_decay.  commit_permille
-     * and per-axis init_vel_* (all captured at to_coasting) shape a
-     * velocity-tapered extra loss so weakly-committed gestures shed
-     * their upper-speed phase quickly while the tail converges at the
-     * unscaled baseline rate. */
-    if (ax != AXIS_X) apply_decay(&data->vel_y, cfg,
-                                  data->commit_permille,
-                                  data->init_vel_y);
-    if (ax != AXIS_Y) apply_decay(&data->vel_x, cfg,
-                                  data->commit_permille,
-                                  data->init_vel_x);
+     * and per-axis init_vel_* / init_mag (all captured at to_coasting)
+     * shape a velocity-tapered extra loss so weakly-committed gestures
+     * shed their upper-speed phase quickly while the tail converges at
+     * the unscaled baseline rate.
+     *
+     * AXIS_BOTH routes through the magnitude-based apply_decay_2d so
+     * diagonal coasts decay at the same physical speed as axis-aligned
+     * ones — Coulomb friction and zone boundaries both key off the
+     * vector magnitude, not the per-axis component. */
+    if (ax == AXIS_BOTH) {
+        apply_decay_2d(&data->vel_y, &data->vel_x, cfg,
+                       data->commit_permille, data->init_mag);
+    } else {
+        if (ax != AXIS_X) apply_decay(&data->vel_y, cfg,
+                                      data->commit_permille,
+                                      data->init_vel_y);
+        if (ax != AXIS_Y) apply_decay(&data->vel_x, cfg,
+                                      data->commit_permille,
+                                      data->init_vel_x);
+    }
 
-    /* Stop gate */
-    bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;
-    bool below_x = (ax == AXIS_Y) || abs32(data->vel_x) < cfg->stop_fp;
-    if (below_y && below_x) {
+    /* Stop gate — per-axis in single-axis mode, vector magnitude in
+     * AXIS_BOTH so stop_fp retains its "physical coast speed" meaning
+     * (per the `stop` property's documented units) regardless of
+     * gesture angle. */
+    bool stopped;
+    if (ax == AXIS_BOTH) {
+        stopped = fast_magnitude(data->vel_y, data->vel_x) < cfg->stop_fp;
+    } else {
+        bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;
+        bool below_x = (ax == AXIS_Y) || abs32(data->vel_x) < cfg->stop_fp;
+        stopped = below_y && below_x;
+    }
+    if (stopped) {
         to_idle(data);
         return;
     }

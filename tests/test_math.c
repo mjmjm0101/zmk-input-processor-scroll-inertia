@@ -274,6 +274,114 @@ static void test_apply_decay(void) {
 }
 
 /* ------------------------------------------------------------------ */
+static void test_apply_decay_2d(void) {
+    printf("-- apply_decay_2d\n");
+    struct scroll_inertia_config cfg = default_cfg();
+    cfg.friction_fp = 0;   /* isolate multiplicative decay first */
+
+    int32_t vy, vx;
+
+    /* Zero magnitude stays zero (function early-returns). */
+    vy = 0; vx = 0;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    ASSERT_EQ("zero stays zero y", vy, 0);
+    ASSERT_EQ("zero stays zero x", vx, 0);
+
+    /* Pure-axis: reduces to 1D decay.  mag=25600, new_mag=25344
+     * (990/1000), vel_y = 25600 * 25344 / 25600 = 25344. */
+    vy = 25600; vx = 0;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    ASSERT_EQ("pure Y decay", vy, 25344);
+    ASSERT_EQ("pure Y keeps x=0", vx, 0);
+
+    /* Diagonal 45°: both axes scale by the same factor.
+     * mag = fast_magnitude(100,100) = 150.
+     * new_mag = 150 * 990 / 1000 = 148.
+     * vel_y' = 100 * 148 / 150 = 98.  Same for vel_x. */
+    vy = 100; vx = 100;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    ASSERT_EQ("diagonal decay y", vy, 98);
+    ASSERT_EQ("diagonal decay x", vx, 98);
+
+    /* Sign is preserved on both axes. */
+    vy = -100; vx = 100;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    ASSERT_EQ("mixed sign y", vy, -98);
+    ASSERT_EQ("mixed sign x", vx, 98);
+
+    /* Friction on the magnitude, not per-axis.
+     * mag = fast_magnitude(300,400) = 400 + 150 = 550.
+     * decay_* = 1000 (no multiplicative loss), new_mag = 550 - 8 = 542.
+     * vel_y = 300 * 542 / 550 = 295.  vel_x = 400 * 542 / 550 = 394. */
+    cfg.decay_fast = 1000;
+    cfg.decay_slow = 1000;
+    cfg.decay_tail = 1000;
+    cfg.friction_fp = 8;
+    vy = 300; vx = 400;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    ASSERT_EQ("friction diagonal y", vy, 295);
+    ASSERT_EQ("friction diagonal x", vx, 394);
+
+    /* Friction collapses to zero when magnitude falls below friction_fp. */
+    vy = 3; vx = 4;   /* mag = 4 + 1 = 5, below friction_fp = 8 */
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    ASSERT_EQ("friction zeros y", vy, 0);
+    ASSERT_EQ("friction zeros x", vx, 0);
+
+    /* Zone selection uses magnitude, not per-axis.  With fast_fp=200,
+     * a 45° flick of (150,150) has mag=225 → fast zone (rate 900).
+     * Per-axis would only see |vel|=150 → slow zone (rate 950). */
+    cfg = default_cfg();
+    cfg.friction_fp = 0;
+    cfg.fast_fp    = 200;
+    cfg.slow_fp    = 50;
+    cfg.decay_fast = 900;
+    cfg.decay_slow = 950;
+    cfg.decay_tail = 990;
+    vy = 150; vx = 150;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    /* mag=225, new_mag = 225*900/1000 = 202, scale = 202/225.
+     * vel_y = 150 * 202 / 225 = 134.  Same for vel_x. */
+    ASSERT_EQ("magnitude zone y", vy, 134);
+    ASSERT_EQ("magnitude zone x", vx, 134);
+
+    /* Commit taper: at vel == init_mag, taper²=1 (full extra loss).
+     * init_mag=10000, mag=10000, commit=500, decay=990 →
+     * base_loss=10, full_extra=10, extra=10, scaled_loss=20, d=980.
+     * new_mag = 10000 * 980 / 1000 = 9800. */
+    cfg = default_cfg();
+    cfg.friction_fp = 0;
+    vy = 10000; vx = 0;
+    apply_decay_2d(&vy, &vx, &cfg, 500, 10000);
+    ASSERT_EQ("2d taper 1 at commit=500", vy, 9800);
+    ASSERT_EQ("2d taper 1 keeps x=0", vx, 0);
+
+    /* commit_permille == 1000 reproduces unscaled decay. */
+    vy = 10000; vx = 0;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 10000);
+    ASSERT_EQ("2d commit 1000 unscaled", vy, 9900);
+
+    /* init_mag == 0 falls back to unscaled. */
+    vy = 10000; vx = 0;
+    apply_decay_2d(&vy, &vx, &cfg, 500, 0);
+    ASSERT_EQ("2d init_mag=0 unscaled", vy, 9900);
+
+    /* Symmetry check: diagonal (V,V) decays at the same magnitude rate
+     * as axis-aligned of the same magnitude.  For commit=1000 (no
+     * taper) and friction=0, both should lose the same 1% of their
+     * magnitude per tick. */
+    vy = 7071; vx = 7071;   /* diagonal mag ≈ 7071 + 3535 = 10606 */
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    int32_t diag_mag = fast_magnitude(vy, vx);
+    int32_t aligned_y = 10606, aligned_x = 0;
+    apply_decay_2d(&aligned_y, &aligned_x, &cfg, 1000, 0);
+    int32_t aligned_mag = fast_magnitude(aligned_y, aligned_x);
+    /* Both should land within a small rounding error of 10606 × 0.99 ≈ 10500. */
+    ASSERT_TRUE("symmetry diagonal ≈ aligned",
+                abs32(diag_mag - aligned_mag) <= 2);
+}
+
+/* ------------------------------------------------------------------ */
 static void test_accumulate_and_emit(void) {
     printf("-- accumulate_and_emit\n");
     struct scroll_inertia_config cfg = default_cfg();
@@ -326,6 +434,7 @@ int main(void) {
     test_peak_reversed();
     test_update_peak();
     test_apply_decay();
+    test_apply_decay_2d();
     test_accumulate_and_emit();
 
     printf("\n%d/%d passed\n", total_tests - failed_tests, total_tests);

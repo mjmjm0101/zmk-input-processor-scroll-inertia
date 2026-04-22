@@ -60,6 +60,7 @@ struct scroll_inertia_config {
     int32_t peak_decay;
     int32_t gesture_timeout_ms;
     int32_t suppress_limit;
+    int32_t handoff_ms;
 };
 
 static inline int32_t abs32(int32_t v) { return v < 0 ? -v : v; }

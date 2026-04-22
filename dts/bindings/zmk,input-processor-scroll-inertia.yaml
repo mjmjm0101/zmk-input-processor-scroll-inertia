@@ -291,3 +291,29 @@ properties:
       TRACKING.  50 events ≈ 400 ms at 125 Hz.  Recommended range
       [20, 200].  Low values cause needless drop-outs on valid long
       coasts; high values let stuck states persist longer.
+  handoff-ms:
+    type: int
+    default: 100
+    description: |
+      Duration (ms) after inertia starts during which any
+      below-inertia same-direction event is absorbed unconditionally.
+      Covers the brief period where the ball's natural post-flick
+      deceleration is still producing events that should not interrupt
+      the coast.
+
+      After this window closes, a same-direction event is only passed
+      through when it is *clearly weaker* than the current inertia
+      (below half of inertia_vel).  The ball's natural deceleration
+      decays more slowly than the configured inertia, so its tail
+      events stay close to inertia_vel and continue to be absorbed —
+      this keeps normal flick behaviour unchanged.  A genuinely weak
+      new user gesture (e.g. gently nudging the ball during a coast)
+      falls far below half inertia_vel and passes through, avoiding
+      the visible stall where absorbed weak input coincides with the
+      late-coast sparse-emit regime.
+
+      Stronger events (above inertia velocity) still bump and absorb
+      regardless of window — they refresh the inertia rather than
+      fighting it.  Recommended range [50, 300].  Too short clips
+      heavy-ball natural deceleration; too long lets the stall
+      symptom reappear.

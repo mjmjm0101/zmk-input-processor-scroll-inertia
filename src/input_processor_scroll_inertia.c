@@ -461,31 +461,64 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
                     (event->value > 0) == (inertia_vel > 0);
 
     if (same_dir) {
-        /* Absorb.  The ball's natural deceleration may briefly
-         * fluctuate above the (faster-decaying) inertia velocity —
-         * bump the inertia velocity up to track the ball instead of
-         * cancelling, keeping the handoff seamless. */
-        if (abs32(event_vel_fp) > abs32(inertia_vel)) {
-            if (is_y) data->vel_y = event_vel_fp;
-            else      data->vel_x = event_vel_fp;
-        }
-        event->value = 0;
-        data->suppress_count++;
         /* Tracked-axis activity means the user isn't just cross-
          * rolling; clear the cross accumulator so diagonal coasts
          * (interleaved tracked/cross events) don't reach the break
-         * threshold through accumulated X alone. */
+         * threshold through accumulated X alone.  Shared across all
+         * three same-direction branches below. */
         data->cross_axis_accumulated = 0;
 
-        if (data->suppress_count >= cfg->suppress_limit) {
-            /* Long same-direction absorption — user has been actively
-             * rolling past a stale coast.  Drop back to TRACKING and
-             * let the current event flow. */
-            to_tracking_from_coasting(data);
-            /* The event's value was zeroed above; do not revive it.
-             * Subsequent events will be processed in TRACKING fresh. */
+        /* Bump.  The ball's natural deceleration may briefly fluctuate
+         * above the (faster-decaying) inertia velocity — bump the
+         * inertia velocity up to track the ball instead of cancelling,
+         * keeping the handoff seamless.  A new deliberate flick above
+         * the current inertia velocity takes the same path, which is
+         * fine: it refreshes the coast rather than fighting it. */
+        if (abs32(event_vel_fp) > abs32(inertia_vel)) {
+            if (is_y) data->vel_y = event_vel_fp;
+            else      data->vel_x = event_vel_fp;
+            event->value = 0;
+            data->suppress_count++;
+            if (data->suppress_count >= cfg->suppress_limit) {
+                /* Long same-direction absorption — user has been
+                 * actively rolling past a stale coast.  Drop back to
+                 * TRACKING.  The event's value was zeroed above; do
+                 * not revive it. */
+                to_tracking_from_coasting(data);
+            }
+            return false;
         }
-        return false;
+
+        /* Below-inertia same-direction event.  Two sub-cases:
+         *
+         * (1) Within the handoff window, OR event velocity sits close
+         *     to the current inertia — this is almost certainly the
+         *     tail of the ball's natural post-flick deceleration (which
+         *     decays more slowly than the configured inertia, so its
+         *     events stay within ~50% of inertia_vel as the bump path
+         *     tracks it).  Absorb to avoid double-emitting the same
+         *     physical motion that inertia is already representing.
+         *
+         * (2) Post-handoff AND event velocity is clearly below half
+         *     of inertia — a new weak user gesture, not ball tail.
+         *     Pass through so the user's own input drives visible
+         *     scroll alongside the decaying tick; silently absorbing
+         *     it would stall the screen at the late-coast sparse-emit
+         *     regime.  We do not cancel the coast: the event is much
+         *     weaker than the current inertia, so letting inertia
+         *     finish out is the natural behaviour. */
+        int64_t coast_age = k_uptime_get() - data->inertia_start_time;
+        bool clearly_weaker = abs32(event_vel_fp) < (abs32(inertia_vel) >> 1);
+        if (coast_age < cfg->handoff_ms || !clearly_weaker) {
+            event->value = 0;
+            data->suppress_count++;
+            if (data->suppress_count >= cfg->suppress_limit) {
+                to_tracking_from_coasting(data);
+            }
+            return false;
+        }
+
+        return true;
     }
 
     /* Reverse direction — user wants to scroll the other way.  Cancel
@@ -822,6 +855,7 @@ static struct zmk_input_processor_driver_api scroll_inertia_driver_api = {
         .peak_decay         = DT_INST_PROP(n, peak_decay),                    \
         .gesture_timeout_ms = DT_INST_PROP(n, gesture_timeout),               \
         .suppress_limit     = DT_INST_PROP(n, suppress_limit),                \
+        .handoff_ms         = DT_INST_PROP(n, handoff_ms),                    \
     };                                                                        \
     DEVICE_DT_INST_DEFINE(n, scroll_inertia_init, NULL,                       \
                           &scroll_inertia_data_##n,                           \

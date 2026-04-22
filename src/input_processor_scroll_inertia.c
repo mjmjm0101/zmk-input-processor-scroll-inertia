@@ -557,6 +557,82 @@ static bool handle_tracked_in_coasting(struct scroll_inertia_data *data,
     return handle_tracked_in_tracking(data, cfg, event, raw_value);
 }
 
+/* AXIS_BOTH COASTING handler.  2D-pan semantics: X and Y are equal
+ * first-class axes and each is absorbed / bumped / reset on its own,
+ * so a pure Y coast isn't cancelled by an unrelated X input and a
+ * reverse on one axis doesn't kill the other axis's coast.
+ *
+ * Differences from the single-axis handler:
+ *   - Event axis with axis_vel == 0 is a *fresh* axis (not a reversal);
+ *     pass through and leave the other axis coasting.
+ *   - Reverse on an axis is a *partial reset*: zero only that axis's
+ *     vel / peak / accum, keep coasting on the other axis.  Only when
+ *     both axes are now dead do we fall back to the shared
+ *     to_tracking_from_coasting path.
+ *
+ * Same-direction bump / absorb / weak-passthrough semantics mirror the
+ * single-axis handler one-to-one (intentional duplication to keep each
+ * handler's logic readable in isolation). */
+static bool handle_tracked_in_coasting_both(struct scroll_inertia_data *data,
+                                           const struct scroll_inertia_config *cfg,
+                                           struct input_event *event,
+                                           int32_t raw_value) {
+    bool is_y = (event->code == INPUT_REL_WHEEL);
+    int32_t *axis_vel   = is_y ? &data->vel_y      : &data->vel_x;
+    int32_t *axis_peak  = is_y ? &data->peak_vel_y : &data->peak_vel_x;
+    int32_t *axis_accum = is_y ? &data->accum_y    : &data->accum_x;
+    int32_t event_vel_fp = event->value * FP_SCALE;
+
+    /* Fresh axis.  The user is adding a new pan direction while the
+     * other axis still coasts; don't treat vel==0 as a reversal.  We
+     * intentionally don't build a new coast on this axis here — arming
+     * only happens via TRACKING, which keeps the state machine simple. */
+    if (*axis_vel == 0) {
+        return true;
+    }
+
+    bool same_dir = (event->value > 0) == (*axis_vel > 0);
+    if (same_dir) {
+        if (abs32(event_vel_fp) > abs32(*axis_vel)) {
+            *axis_vel = event_vel_fp;
+            event->value = 0;
+            data->suppress_count++;
+            if (data->suppress_count >= cfg->suppress_limit) {
+                to_tracking_from_coasting(data);
+            }
+            return false;
+        }
+
+        int64_t coast_age = k_uptime_get() - data->inertia_start_time;
+        bool clearly_weaker = abs32(event_vel_fp) < (abs32(*axis_vel) >> 1);
+        if (coast_age < cfg->handoff_ms || !clearly_weaker) {
+            event->value = 0;
+            data->suppress_count++;
+            if (data->suppress_count >= cfg->suppress_limit) {
+                to_tracking_from_coasting(data);
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    /* Reverse on this axis.  Partial reset so the user regains direct
+     * control on this axis; the other axis keeps coasting.  Only fall
+     * back to TRACKING when both axes are dead — otherwise we'd kill a
+     * legitimate orthogonal coast. */
+    *axis_vel   = 0;
+    *axis_peak  = 0;
+    *axis_accum = 0;
+
+    int32_t other_vel = is_y ? data->vel_x : data->vel_y;
+    if (other_vel == 0) {
+        to_tracking_from_coasting(data);
+        return handle_tracked_in_tracking(data, cfg, event, raw_value);
+    }
+    return true;
+}
+
 /* Single-axis cross-axis events never pass through downstream.  They
  * - stash the value in pending_other so the next tracked-axis event
  *   can magnitude-merge it (preserving the "diagonal = full scroll"
@@ -831,7 +907,9 @@ static int scroll_inertia_handle_event(const struct device *dev,
         pass_through = handle_tracked_in_tracking(data, cfg, event, raw_value);
         break;
     case SS_COASTING:
-        pass_through = handle_tracked_in_coasting(data, cfg, event, raw_value);
+        pass_through = (ax == AXIS_BOTH)
+            ? handle_tracked_in_coasting_both(data, cfg, event, raw_value)
+            : handle_tracked_in_coasting(data, cfg, event, raw_value);
         break;
     }
 

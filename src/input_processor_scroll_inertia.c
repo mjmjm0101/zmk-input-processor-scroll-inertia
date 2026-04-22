@@ -24,8 +24,11 @@
  *   TRACKING → COASTING  peak magnitude ≥ start, movement ≥ move,
  *                        ≥ min-events, then deceleration
  *                        confirmed (or stop_detect fallback)
- *   COASTING → TRACKING  reverse direction, cross-axis break, or
- *                        suppress-limit same-dir absorbs
+ *   COASTING → TRACKING  single-axis: reverse direction, cross-axis
+ *                        break, or suppress-limit same-dir absorbs.
+ *                        AXIS_BOTH: reverse partial-resets one axis
+ *                        and keeps coasting; transition fires only
+ *                        when both axes are dead, or on suppress-limit
  *   COASTING → IDLE      vel < stop, span exceeded, layer off
  *   any → IDLE           gesture timeout, or stale inertia
  *                        (see should_reset_on_timeout)

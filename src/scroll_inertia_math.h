@@ -157,7 +157,7 @@ static inline int32_t select_decay_rate(int32_t speed,
  * regardless of commitment — only the upper band shrinks.
  *
  * Pass commit_permille = 1000 (or init_speed = 0) to short-circuit to
- * the unscaled baseline decay (host tests and AXIS_BOTH fallback). */
+ * the unscaled baseline decay (used by host tests). */
 static inline int32_t apply_commit_taper(int32_t d, int32_t speed,
                                          int32_t init_speed,
                                          int32_t commit_permille,

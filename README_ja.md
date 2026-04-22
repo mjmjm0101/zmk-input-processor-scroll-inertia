@@ -432,7 +432,7 @@ iOS風のスクロールは「ボールの動きと画面のスクロールが 1
 |---|---|
 | `IDLE → TRACKING` | 最初のスクロールイベント |
 | `TRACKING → COASTING` | ピークのベクトル強度 ≥ `start` かつ累積移動量 ≥ `move` かつイベント `min-events` 回以上（直前のCOASTINGから戻ってきた場合はこの条件をスキップ）→ そのうえで減速が `decel-samples` 回連続で検出された時点。急停止の場合は `release` ms 後に発火する stop_detect が同じ条件で判定 |
-| `COASTING → TRACKING` | 逆方向のイベント、クロス軸ブレーク（single-axis モードで非トラック軸の累積入力が `move` 超過）、または同方向吸収が `suppress-limit` 回連続（保険） |
+| `COASTING → TRACKING` | **single-axis**: 逆方向イベント、クロス軸ブレーク（COASTING 中の非トラック軸の累積入力が `move` 超過）、または同方向吸収が `suppress-limit` 回連続（保険）。**AXIS_BOTH**: 部分リセットで両軸とも無効になった時点（片軸の逆方向はその軸だけ部分リセット — COASTING の項を参照）、または同方向吸収が `suppress-limit` 回連続。 |
 | `COASTING → IDLE` | 速度が `stop` 未満になる / `span` 到達 / レイヤー無効 |
 | *任意の状態* `→ IDLE` | ジェスチャータイムアウト（`gesture-timeout` ms イベントなし）、または慣性の取り残し検出（COASTING 中に2tick分イベントなし） |
 
@@ -455,6 +455,29 @@ iOS風のスクロールは「ボールの動きと画面のスクロールが 1
    `tick` ms ごとにタイマーが発火し、速度を`decay` で減らして（`move` ギリのジェスチャーほど高速域の減衰が速まるよう軽く補正されます）`friction` を引き、たまったらスクロールとして PC に送信します。
    途中で同方向のイベントが来れば吸収（必要に応じて速度を合わせる）、逆方向なら TRACKING に戻して直接操作を受け付けます。
    速度が `stop` 未満になる / レイヤーがオフになる / `span` に達する のいずれかで IDLE に戻ります。
+
+   ここまでの説明は single-axis モード（`axis = <1>` または `<2>`）の挙動です。
+   `axis = <0>`（AXIS_BOTH）は 2Dパン向けの専用 COASTING ハンドラを使うので、次項で違いを説明します。
+
+#### AXIS_BOTH（2Dパン）固有の COASTING 挙動
+
+`axis = <0>` はマップ・デザインツールなどの 2Dパン用途を想定しており、COASTING の挙動が single-axis モードといくつか異なります：
+
+- **軸別の coast 初速。**
+  突入時、`vel_x` と `vel_y` はトラッキングの EMA 値をそのまま引き継ぎます（片軸への畳み込みなし）。斜め flick は斜めに滑走します。
+  ベクトル長が `limit` を超える場合のみ両軸を比例縮小して物理速度の上限を `limit` に揃えます（single-axis と同じキャップ）。
+- **magnitude ベースの decay。**
+  decay と friction はベクトル長に対して適用され、軸は比例スケールされます。45° の coast は軸方向の coast と同じ物理減速率になります。
+  zone 境界（`fast`, `slow`）と stop gate もベクトル長で判定。
+- **fresh axis の pass-through。**
+  `vel == 0` の軸にイベントが来た場合（片軸だけの coast 中）、逆方向ではなく「新しいパン方向」として扱い、そのまま通します。他軸の coast は継続。
+- **逆方向時の部分リセット。**
+  片軸が逆方向になった場合、その軸の vel / peak / accum だけゼロ化し、直交軸の coast は継続します。
+  両軸とも無効になった場合のみ TRACKING に戻ります（あるいは `suppress-limit` 到達時）。
+- **クロス軸ブレークなし。**
+  両軸ともトラック対象なので、single-axis の「非トラック軸が能動的に回された時の保険」は不要です。
+
+同方向の bump / absorb / weak-passthrough は各軸で single-axis と同じ扱いです（共通ヘルパ）。
 
 ### 自動リセット
 

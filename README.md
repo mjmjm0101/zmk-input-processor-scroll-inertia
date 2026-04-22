@@ -416,7 +416,7 @@ Transitions in detail:
 |---|---|
 | `IDLE → TRACKING` | First tracked-axis event. |
 | `TRACKING → COASTING` | Peak magnitude ≥ `start`, total movement ≥ `move`, ≥ `min-events` (skipped when TRACKING was entered directly from a prior COASTING), then deceleration confirmed (`decel-samples` consecutive sub-peak samples).  Or the `stop_detect` fallback fires after `release` ms of silence with the same conditions. |
-| `COASTING → TRACKING` | Reverse-direction event, cross-axis freeze break (cumulative cross-axis motion ≥ `move` while coasting, in single-axis modes), or `suppress-limit` consecutive same-direction absorbed events (suppress safety). |
+| `COASTING → TRACKING` | **Single-axis:** reverse-direction event, cross-axis freeze break (cumulative cross-axis motion ≥ `move`), or `suppress-limit` consecutive same-direction absorbed events (suppress safety).  **AXIS_BOTH:** both axes dead after per-axis partial reset (a reverse on a single axis zeros only that axis — see COASTING below), or `suppress-limit` consecutive same-direction absorbed events. |
 | `COASTING → IDLE` | Velocity < `stop`, `span` exceeded, or the bound layer turns off. |
 | *any* `→ IDLE` | Gesture timeout (no events for `gesture-timeout` ms), or stale-inertia detection (no events for two ticks while COASTING). |
 
@@ -440,6 +440,29 @@ Transitions in detail:
    Each tick multiplies velocity by the configured decay (slightly accelerated in the upper-speed band for gestures that only just cleared `move`, so weakly-committed flicks don't sustain the high-speed phase as long as committed ones), subtracts friction, accumulates, and emits whole scroll units to the host.
    Tracking-axis events that arrive in the same direction are absorbed (possibly bumping velocity to match the ball's actual motion); opposite-direction events cancel inertia back to TRACKING.
    Coasting ends when velocity drops below `stop`, when the layer turns off, or when the `span` safety cap is reached.
+
+   The description above covers single-axis modes (`axis = <1>` or `<2>`).
+   `axis = <0>` (AXIS_BOTH) uses a dedicated COASTING handler with 2D-pan semantics; see the next subsection.
+
+#### AXIS_BOTH (2D pan) coasting
+
+`axis = <0>` targets map / canvas pan use cases where X and Y are equal first-class axes, and the coasting handler diverges from single-axis rules in a few places:
+
+- **Per-axis coast seed.**
+  On entry, `vel_x` and `vel_y` keep their tracking EMA values (no magnitude-fold into a single axis) — a diagonal flick coasts diagonally.
+  If the resulting vector magnitude exceeds `limit`, both components scale down proportionally so the physical coast speed caps at `limit`, matching the single-axis behaviour.
+- **Magnitude-based decay.**
+  Decay and friction apply to the vector magnitude and rescale the axes proportionally, so a 45° coast decelerates at the same physical rate as an axis-aligned coast of equal magnitude.
+  Zone boundaries (`fast`, `slow`) and the stop gate are evaluated on the vector magnitude, not per-axis components.
+- **Fresh-axis pass-through.**
+  An event on an axis with `vel == 0` (pure other-axis coast) is treated as a new pan direction, not a reversal: it passes through while the other axis keeps coasting.
+- **Partial reset on reverse.**
+  A reverse on one axis zeros only that axis's vel / peak / accum; the orthogonal axis continues to coast.
+  The handler only drops back to TRACKING when both axes are dead, or on `suppress-limit`.
+- **No cross-axis break.**
+  Every axis is tracked, so the single-axis "untracked axis actively rolled" safety doesn't apply here.
+
+Same-direction bump / absorb / weak-passthrough on each axis behaves identically to single-axis mode (shared helper).
 
 ### Implicit resets
 

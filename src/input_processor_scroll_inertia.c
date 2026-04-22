@@ -190,12 +190,19 @@ struct scroll_inertia_data {
      * the high-velocity phase as long as a long, committed flick. */
     int32_t commit_permille;
 
-    /* Initial coast velocity magnitude captured at to_coasting.  Used
-     * as the taper reference so the commit-based extra loss is at
-     * full strength near the top of the coast and tapers to zero as
-     * the velocity approaches stop_fp — the stopping behaviour stays
-     * identical to the unscaled path regardless of commitment. */
-    int32_t init_coast_vel;
+    /* Per-axis initial coast velocity magnitude captured at to_coasting
+     * (absolute value, after any limit clamping).  Used as the taper
+     * reference in apply_decay so the commit-based extra loss is at
+     * full strength near the top of the coast (taper ≈ 1.0) and tapers
+     * to zero as that axis approaches stop_fp.
+     *
+     * Per-axis (not a single magnitude) so each axis's taper starts at
+     * 1.0 in AXIS_BOTH too: a diagonal coast where vel_y ≈ vel_x ≈ V
+     * and fast_magnitude ≈ 1.5V would otherwise leave each axis's
+     * taper at V / 1.5V ≈ 0.67, under-applying the commit-based loss
+     * on weakly-committed diagonal flicks. */
+    int32_t init_vel_y;
+    int32_t init_vel_x;
 
     /* Delayed work items */
     struct k_work_delayable stop_detect_work;
@@ -336,9 +343,17 @@ static void to_coasting(struct scroll_inertia_data *data,
     } else if (ax == AXIS_X && data->peak_vel_x != 0) {
         int32_t sign = (data->peak_vel_x > 0) ? 1 : -1;
         data->vel_x = clamp_velocity(cur_mag * sign, cfg->limit_fp);
+    } else if (ax == AXIS_BOTH && cur_mag > cfg->limit_fp) {
+        /* Per-axis clamp in update_velocity_ema bounds each of vel_y
+         * and vel_x to limit_fp individually, which lets a diagonal
+         * coast reach a vector magnitude of up to limit_fp × √2.
+         * `limit` is meant as the runaway cap on the *physical* coast
+         * speed, so in AXIS_BOTH we re-project onto a limit_fp circle
+         * by scaling vel_y and vel_x proportionally — preserves the
+         * gesture's direction while matching the single-axis cap. */
+        data->vel_y = (int64_t)data->vel_y * cfg->limit_fp / cur_mag;
+        data->vel_x = (int64_t)data->vel_x * cfg->limit_fp / cur_mag;
     }
-    /* AXIS_BOTH keeps per-axis vel_y and vel_x as they are — the user
-     * wants diagonal coasting in that mode, not magnitude-folded Y. */
 
     /* Commitment factor (saturation curve): 500 permille right at the
      * arming threshold (total_movement == move), asymptotically
@@ -348,7 +363,10 @@ static void to_coasting(struct scroll_inertia_data *data,
      * rate. */
     data->commit_permille = (int64_t)data->total_movement * 1000
                             / (data->total_movement + cfg->move);
-    data->init_coast_vel = cur_mag;
+    /* Per-axis taper reference, captured post-clamp so taper starts at
+     * 1.0 on each live axis regardless of AXIS_BOTH vs single-axis. */
+    data->init_vel_y = abs32(data->vel_y);
+    data->init_vel_x = abs32(data->vel_x);
 
     k_work_cancel_delayable(&data->stop_detect_work);
     data->state = SS_COASTING;
@@ -756,16 +774,16 @@ static void inertia_tick_handler(struct k_work *work) {
 
     /* Set fast=0 and slow=0 with all three rates equal for a
      * single-curve (iOS-style) decay; see apply_decay.  commit_permille
-     * and init_coast_vel (both captured at to_coasting) shape a
+     * and per-axis init_vel_* (all captured at to_coasting) shape a
      * velocity-tapered extra loss so weakly-committed gestures shed
      * their upper-speed phase quickly while the tail converges at the
      * unscaled baseline rate. */
     if (ax != AXIS_X) apply_decay(&data->vel_y, cfg,
                                   data->commit_permille,
-                                  data->init_coast_vel);
+                                  data->init_vel_y);
     if (ax != AXIS_Y) apply_decay(&data->vel_x, cfg,
                                   data->commit_permille,
-                                  data->init_coast_vel);
+                                  data->init_vel_x);
 
     /* Stop gate */
     bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;

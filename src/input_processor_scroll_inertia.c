@@ -49,9 +49,11 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/input/input.h>
 
-/* This processor emits HID mouse scroll reports via
- * zmk_hid_mouse_scroll_set / zmk_endpoints_send_mouse_report, and ZMK
- * only compiles those (along with zmk_hid_get_explicit_mods and
+/* This processor emits HID mouse scroll reports via the ZMK mouse HID
+ * API (zmk_hid_mouse_* and the endpoint mouse-report function, which
+ * is spelled zmk_endpoints_send_mouse_report on v0.3 and
+ * zmk_endpoint_send_mouse_report post-rename).  ZMK only compiles that
+ * API (together with zmk_hid_get_explicit_mods and
  * zmk_keymap_layer_active) on the central side of a split keyboard.
  * If a DT node for this processor lands on a peripheral build we'd
  * fail to link with undefined references to five symbols and no clear
@@ -61,12 +63,11 @@
  * obvious. */
 #if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 #error "zmk,input-processor-scroll-inertia: central role required. " \
-       "This processor calls the ZMK mouse HID API (zmk_hid_mouse_*, " \
-       "zmk_endpoints_send_mouse_report) which is only compiled on the " \
-       "central side of a split keyboard.  Move the processor DT node " \
-       "(and any input-listener that references it) into a central-only " \
-       "overlay, or guard it with a per-side overlay so the peripheral " \
-       "build does not see it."
+       "This processor calls the ZMK mouse HID API which is only " \
+       "compiled on the central side of a split keyboard.  Move the " \
+       "processor DT node (and any input-listener that references it) " \
+       "into a central-only overlay, or guard it with a per-side " \
+       "overlay so the peripheral build does not see it."
 #endif
 
 #include <drivers/input_processor.h>
@@ -884,7 +885,16 @@ static void inertia_tick_handler(struct k_work *work) {
         }
         zmk_hid_mouse_movement_set(0, 0);
         zmk_hid_mouse_scroll_set(out_x, out_y);
+        /* ZMK renamed zmk_endpoints_send_mouse_report (plural) to
+         * zmk_endpoint_send_mouse_report (singular) after v0.3.  Pick
+         * the right one based on a macro from the same endpoints
+         * refactor (ZMK_ENDPOINT_NONE_COUNT) so the module builds
+         * against either revision without user intervention. */
+#ifdef ZMK_ENDPOINT_NONE_COUNT
+        zmk_endpoint_send_mouse_report();
+#else
         zmk_endpoints_send_mouse_report();
+#endif
         zmk_hid_mouse_scroll_set(0, 0);
     }
 

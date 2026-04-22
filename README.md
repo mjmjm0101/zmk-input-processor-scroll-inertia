@@ -112,6 +112,19 @@ manifest:
       revision: main
 ```
 
+### ZMK version
+
+Tested against **ZMK v0.3.0** (`zmkfirmware/zmk` tag `v0.3`).
+Pin your `zmk` project to this revision (or a compatible one) in `config/west.yml`:
+
+```yaml
+projects:
+  - name: zmk
+    remote: zmkfirmware
+    revision: v0.3
+    import: app/west.yml
+```
+
 ### `*.conf`
 
 Nothing is strictly required — the module turns itself on when it sees a matching node in your overlay, and `CONFIG_ZMK_POINTING` is auto-selected by the module's Kconfig (it's needed for the mouse HID API this processor emits through).
@@ -128,7 +141,7 @@ Two things worth knowing about:
 #### Split keyboards
 
 On a split build this processor **must live on the central side**.
-The ZMK mouse HID (`zmk_hid_mouse_*`, `zmk_endpoints_send_mouse_report`) is only compiled for the central role, and the processor has no meaningful work to do on a peripheral (HID goes to the host from central).
+The ZMK mouse HID API is only compiled for the central role, and the processor has no meaningful work to do on a peripheral (HID goes to the host from central).
 
 If a DT node for this processor lands on a peripheral build, the module fails the build at compile time with an explicit error pointing at the misconfiguration — it won't silently skip.
 Fix it by keeping the processor node (and any input-listener that references it) in a central-only overlay, or by scoping a shared overlay appropriately.

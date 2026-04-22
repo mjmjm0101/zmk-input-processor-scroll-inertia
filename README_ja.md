@@ -120,6 +120,19 @@ manifest:
       revision: main
 ```
 
+### ZMK のバージョン
+
+**ZMK v0.3.0**（`zmkfirmware/zmk` タグ `v0.3`）で動作確認しています。
+`config/west.yml` の `zmk` プロジェクトを該当リビジョン（または互換バージョン）に固定してください：
+
+```yaml
+projects:
+  - name: zmk
+    remote: zmkfirmware
+    revision: v0.3
+    import: app/west.yml
+```
+
 ### `*.conf` ファイル
 
 必須の追加はありません。
@@ -137,7 +150,7 @@ manifest:
 #### 分割キーボードの場合
 
 分割ビルドでは、このプロセッサは **central 側に置く必要があります**。
-ZMK のマウス HID API（`zmk_hid_mouse_*`, `zmk_endpoints_send_mouse_report`）は central ロールでしか compile されず、peripheral 側にプロセッサを置いても HID 出力は central からしか出ないので意味がありません。
+ZMK のマウス HID API は central ロールでしか compile されず、peripheral 側にプロセッサを置いても HID 出力は central からしか出ないので意味がありません。
 
 DT ノードが peripheral ビルドに含まれると、モジュールはコンパイル時に明示的なエラーで停止します（silent skip はしません）。
 プロセッサの DT ノード（および参照している input-listener）を central 専用 overlay に置くか、共有 overlay を side-scope するかして解決してください。

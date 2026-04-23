@@ -1,0 +1,88 @@
+name: Bug report
+description: Report a bug or unexpected behaviour in scroll_inertia
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file an issue.
+
+        Please fill in **all** sections below. Reports missing key
+        information are unlikely to get a useful response — see
+        [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: Trackball sensor, keyboard, and ZMK board.
+      placeholder: e.g. PMW3360 on Charybdis Nano, nice!nano v2
+    validations:
+      required: true
+
+  - type: input
+    id: zmk-version
+    attributes:
+      label: ZMK version / west manifest revision
+      description: Tag, branch, or commit SHA of ZMK you are building against.
+      placeholder: e.g. v0.3 / main @ abc1234
+    validations:
+      required: true
+
+  - type: textarea
+    id: devicetree
+    attributes:
+      label: Devicetree
+      description: |
+        The `&scroll_inertia` instance and the `input-processors`
+        chain it sits in.
+      render: dts
+      placeholder: |
+        &scroll_inertia {
+            /* ... */
+        };
+
+        / {
+            trackball_listener {
+                input-processors = <&zip_xy_scaler ...>, <&scroll_inertia>, ...;
+            };
+        };
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: tuning
+    attributes:
+      label: Tuning changes (if applicable)
+      description: |
+        If this is tuning-related, list which properties you changed
+        from the defaults and their new values. Leave blank if you
+        are running stock defaults.
+      placeholder: |
+        e.g.
+        coast-decay-num = <93>;
+        coast-decay-den = <100>;
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Logs, screenshots, videos, or anything else useful.
+    validations:
+      required: false

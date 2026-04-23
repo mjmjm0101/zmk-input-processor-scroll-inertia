@@ -431,6 +431,12 @@ A mismatched `tick` doesn't break anything, but matching it makes the handoff be
 
 ---
 
+## Tuning by Polling Rate
+
+See the Wiki: [Polling Rate Tuning Starting Points](https://github.com/mjmjm0101/zmk-input-processor-scroll-inertia/wiki/Polling-Rate-Tuning-Starting-Points)
+
+---
+
 ## How it works
 
 The processor runs a small three-state machine per instance:

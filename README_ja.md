@@ -448,6 +448,12 @@ iOS風のスクロールは「ボールの動きと画面のスクロールが 1
 
 ---
 
+## ポーリングレート別のチューニング
+
+Wiki を参照してください: [Polling Rate Tuning Starting Points](https://github.com/mjmjm0101/zmk-input-processor-scroll-inertia/wiki/Polling-Rate-Tuning-Starting-Points)
+
+---
+
 ## 動作の仕組み
 
 このモジュールは各インスタンスを3状態のステートマシンとして実装しています：

@@ -261,7 +261,7 @@ This avoids floating-point math on the keyboard.
 | `scale` | `1000` | Output scale numerator. |
 | `scale-div` | `1000` | Output scale denominator.  Each tick adds `velocity × scale / scale-div` to an internal accumulator and emits whole scroll units when it overflows. |
 | `limit` | `600` | Velocity safety cap.  Keeps a wild flick from producing absurd inertia. |
-| `span` | `6000` | Maximum inertia duration in milliseconds.  This is a runaway safety cap; the natural fade usually finishes much earlier. |
+| `span` | `6000` | Runaway safety cap on inertia duration in milliseconds; the natural fade usually finishes much earlier.  A same-direction event whose magnitude meets `start` re-seats this timer (treated as a fresh flick), so strong repeated same-direction flicks are not truncated by the cap. |
 | `tick` | `8` | How often the inertia step runs, in milliseconds.  Match your sensor's polling rate (8 ms ≈ 125 Hz). |
 | `axis` | `0` | `0` = both axes (diagonal), `1` = Y only (vertical), `2` = X only (horizontal). |
 | `layer` | `-1` | If `>= 0`, inertia stops the moment this layer turns off.  `-1` disables the check. |

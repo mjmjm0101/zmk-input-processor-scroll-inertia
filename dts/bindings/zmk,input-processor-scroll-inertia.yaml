@@ -181,8 +181,11 @@ properties:
     type: int
     default: 6000
     description: |
-      Maximum inertia duration in milliseconds.  Acts as a runaway
-      safety cap; natural decay typically terminates earlier.
+      Runaway safety cap on inertia duration in milliseconds; natural
+      decay typically terminates earlier.  A same-direction event
+      whose magnitude meets `start` is treated as a fresh flick and
+      re-seats this timer, so strong repeated same-direction flicks
+      are not truncated by the cap.
   tick:
     type: int
     default: 8

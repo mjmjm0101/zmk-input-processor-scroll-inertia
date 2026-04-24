@@ -552,8 +552,13 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
  * the (faster-decaying) inertia velocity — bump the inertia velocity
  * up to track the ball instead of cancelling, keeping the handoff
  * seamless.  A new deliberate flick above the current inertia velocity
- * takes the same path, which is fine: it refreshes the coast rather
- * than fighting it.
+ * takes the same path; when its magnitude meets start_fp we treat it
+ * as a fresh coast and re-seat inertia_start_time / commit_permille.
+ * Without that, same-direction repeated flicks would all be measured
+ * against span_ms from the ORIGINAL coast's start — the safety cap
+ * would kill the inertia mid-gesture on a long series of restarts.
+ * The start_fp gate keeps the reset from firing on ball-tail jitter
+ * (which is well below the arming threshold).
  *
  * Below-coast same-direction event has two sub-cases:
  *   (1) Within the handoff window, OR event velocity sits close to
@@ -579,6 +584,19 @@ static bool coast_same_dir(struct scroll_inertia_data *data,
 
     if (abs32(event_vel_fp) > abs32(compare_vel)) {
         *axis_vel = event_vel_fp;
+        /* Fresh-flick bump: |event_vel| meeting start_fp means this is
+         * a new deliberate flick, not ball-tail jitter.  Re-seat the
+         * span reference so the safety cap re-measures from this
+         * flick, and force commit_permille to 1000 to disable the
+         * commit taper for the rest of the coast — apply_commit_taper
+         * short-circuits at >= 1000, so the stale low commit from a
+         * weakly-armed original gesture can't amplify decay against
+         * the bumped-up velocity.  init_vel_* / init_mag are left
+         * stale on purpose; commit=1000 makes them irrelevant. */
+        if (abs32(event_vel_fp) >= cfg->start_fp) {
+            data->inertia_start_time = k_uptime_get();
+            data->commit_permille = 1000;
+        }
         event->value = 0;
         data->suppress_count++;
         if (data->suppress_count >= cfg->suppress_limit) {

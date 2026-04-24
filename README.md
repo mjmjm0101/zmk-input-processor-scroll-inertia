@@ -383,6 +383,10 @@ The two thresholds work independently — `start` filters by peak **vector** spe
 Both must be cleared for inertia to start.
 Because `start` operates on the magnitude, sloppy-angle flicks and precise flicks hit the same threshold at the same physical strength.
 
+By default the magnitude uses an integer approximation (max + min/2) that overestimates diagonals by up to ~12% — plenty good for threshold comparison, and consistent with the rest of the integer-only hot path.
+Set `exact-magnitude;` (boolean) if you want strictly angle-invariant behaviour: every magnitude then routes through `√(x²+y²)` (integer Newton's sqrt, no libm), making `start` / `stop` / `decel-ratio` / `suppress-limit` and the cross-axis merge exact.
+Expect to trim `start` by a few percent after enabling, since diagonal flicks now compare against their true (slightly lower) magnitude.
+
 ### Pick a decay rate that matches your style
 
 The default `decay-* = 990` gives an iOS-like long, smooth tail.
@@ -463,7 +467,7 @@ Transitions in detail:
 2. **TRACKING.**
    Every event updates a per-axis smoothed velocity (moving average) and a per-axis "peak so far" that slowly drifts down toward the current value when no new high is reached.
    The tracking state is fully angle-invariant: EMA, peak, and total movement are all fed from the event's **raw** delta, so a cross-axis event contributes exactly once and a tracked-axis event exactly once — no double counting through the merge.
-   Both arming and deceleration detection compare *vector magnitudes* (`√(peak_x² + peak_y²)`, approximated) rather than per-axis values, so a sloppy-angle flick crosses thresholds at the same overall strength as an axis-aligned one.
+   Both arming and deceleration detection compare *vector magnitudes* (`√(peak_x² + peak_y²)`, approximated with `max(|x|,|y|) + min/2` by default, or the exact Pythagorean formula when `exact-magnitude` is set) rather than per-axis values, so a sloppy-angle flick crosses thresholds at the same overall strength as an axis-aligned one.
    Once magnitude ≥ `start`, total movement ≥ `move`, and at least `min-events` events have been seen, the gesture is *armed* — if the magnitude then drops below `decel-ratio`/1000 of the peak magnitude for `decel-samples` events in a row, the processor transitions to COASTING.
    If no events arrive for `release` ms while armed, a fallback "stop detect" timer performs the same check for abrupt releases.
    **Post-coast shortcut:** if TRACKING was entered directly from a prior COASTING (reverse flick, cross-axis break, suppress safety, or stale-inertia reset), the `min-events` gate is skipped on the next arm — the previous coast already proved the gesture was committed, so short rapid reversal flicks don't need to re-accumulate 10 events per direction.

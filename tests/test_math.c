@@ -92,6 +92,92 @@ static void test_fast_magnitude(void) {
 }
 
 /* ------------------------------------------------------------------ */
+static void test_isqrt64(void) {
+    printf("-- isqrt64\n");
+    ASSERT_EQ("0",            isqrt64(0), 0);
+    ASSERT_EQ("1",            isqrt64(1), 1);
+    ASSERT_EQ("2 (floor)",    isqrt64(2), 1);
+    ASSERT_EQ("3 (floor)",    isqrt64(3), 1);
+    ASSERT_EQ("4",            isqrt64(4), 2);
+    ASSERT_EQ("9",            isqrt64(9), 3);
+    ASSERT_EQ("25",           isqrt64(25), 5);
+    /* sqrt(200) ≈ 14.142 → floor = 14 */
+    ASSERT_EQ("200 (floor)",  isqrt64(200), 14);
+    ASSERT_EQ("10000",        isqrt64(10000), 100);
+    /* Large value well past int32 range, proves int64 domain works. */
+    ASSERT_EQ("100000²",      isqrt64((int64_t)100000 * 100000), 100000);
+    /* Negative input guarded to 0 (Newton would loop otherwise). */
+    ASSERT_EQ("neg guarded",  isqrt64(-1), 0);
+    ASSERT_EQ("neg big",      isqrt64(INT64_MIN), 0);
+}
+
+/* ------------------------------------------------------------------ */
+static void test_exact_magnitude(void) {
+    printf("-- exact_magnitude\n");
+    ASSERT_EQ("(0,0)",       exact_magnitude(0, 0), 0);
+    ASSERT_EQ("(5,0)",       exact_magnitude(5, 0), 5);
+    ASSERT_EQ("(0,5)",       exact_magnitude(0, 5), 5);
+    /* Sign handled by squaring — no abs32 needed. */
+    ASSERT_EQ("(-5,0)",      exact_magnitude(-5, 0), 5);
+    ASSERT_EQ("(0,-5)",      exact_magnitude(0, -5), 5);
+    ASSERT_EQ("(-5,-12)",    exact_magnitude(-5, -12), 13);
+    /* Pythagorean triples → exact integer answer. */
+    ASSERT_EQ("(3,4)",       exact_magnitude(3, 4), 5);
+    ASSERT_EQ("(5,12)",      exact_magnitude(5, 12), 13);
+    ASSERT_EQ("(8,15)",      exact_magnitude(8, 15), 17);
+    /* 45° diagonal: sqrt(20000) ≈ 141.42 → floor 141.
+     * Contrast fast_magnitude(100,100) = 150 (~6% over). */
+    ASSERT_EQ("(100,100)",   exact_magnitude(100, 100), 141);
+    /* Worst-case fast_magnitude angle atan(1/2): sqrt(1²+2²)=2.236.
+     * For (1000,2000): exact floor(2236.07) = 2236; fast = 2000+500 = 2500. */
+    ASSERT_EQ("(1000,2000)", exact_magnitude(1000, 2000), 2236);
+    /* Exact is never greater than fast — the approximation overestimates. */
+    ASSERT_TRUE("exact ≤ fast (100,100)",
+                exact_magnitude(100, 100) <= fast_magnitude(100, 100));
+    ASSERT_TRUE("exact ≤ fast (1000,2000)",
+                exact_magnitude(1000, 2000) <= fast_magnitude(1000, 2000));
+    /* Near int32 max input (limit_fp range): no overflow, sensible result.
+     * 150000² × 2 ≈ 4.5e10 — needs int64.  sqrt(2) * 150000 ≈ 212132. */
+    ASSERT_EQ("large (150000,150000)",
+              exact_magnitude(150000, 150000), 212132);
+}
+
+/* ------------------------------------------------------------------ */
+static void test_magnitude_dispatcher(void) {
+    printf("-- magnitude (dispatcher)\n");
+    struct scroll_inertia_config cfg = default_cfg();
+
+    /* Default path (exact_magnitude=0) routes to fast_magnitude. */
+    cfg.exact_magnitude = 0;
+    ASSERT_EQ("default (0,0)",
+              magnitude(0, 0, &cfg), fast_magnitude(0, 0));
+    ASSERT_EQ("default (3,4)",
+              magnitude(3, 4, &cfg), fast_magnitude(3, 4));
+    ASSERT_EQ("default (100,100)",
+              magnitude(100, 100, &cfg), fast_magnitude(100, 100));
+    ASSERT_EQ("default (-1000,500)",
+              magnitude(-1000, 500, &cfg), fast_magnitude(-1000, 500));
+
+    /* Opt-in path (exact_magnitude=1) routes to exact_magnitude. */
+    cfg.exact_magnitude = 1;
+    ASSERT_EQ("exact (0,0)",
+              magnitude(0, 0, &cfg), exact_magnitude(0, 0));
+    ASSERT_EQ("exact (3,4)",
+              magnitude(3, 4, &cfg), exact_magnitude(3, 4));
+    ASSERT_EQ("exact (100,100)",
+              magnitude(100, 100, &cfg), exact_magnitude(100, 100));
+    ASSERT_EQ("exact (-1000,500)",
+              magnitude(-1000, 500, &cfg), exact_magnitude(-1000, 500));
+
+    /* Dispatcher actually differs between the two paths on diagonals. */
+    cfg.exact_magnitude = 0;
+    int32_t approx = magnitude(100, 100, &cfg);
+    cfg.exact_magnitude = 1;
+    int32_t exact = magnitude(100, 100, &cfg);
+    ASSERT_TRUE("dispatcher branches differ on diagonals", approx != exact);
+}
+
+/* ------------------------------------------------------------------ */
 static void test_clamp_velocity(void) {
     printf("-- clamp_velocity\n");
     ASSERT_EQ("in range",     clamp_velocity(100, 200), 100);
@@ -379,6 +465,35 @@ static void test_apply_decay_2d(void) {
     /* Both should land within a small rounding error of 10606 × 0.99 ≈ 10500. */
     ASSERT_TRUE("symmetry diagonal ≈ aligned",
                 abs32(diag_mag - aligned_mag) <= 2);
+
+    /* apply_decay_2d routes through magnitude() — the easiest way to
+     * see the dispatch actually fires is a zone boundary positioned
+     * *between* the fast and exact magnitudes of the same vector.
+     * For a 45° (100,100) vector: fast=150, exact=141.  Setting
+     * fast_fp=145 places the fast-magnitude path in the fast zone
+     * (rate 900) and the exact path in the slow zone (rate 950), so
+     * the two shrink by clearly different factors.
+     *
+     * Same-rate decays can't distinguish the paths (the final
+     * vel_y = v * new_mag / mag cancels the mag difference to an
+     * integer-rounding noise level), so don't use uniform rates here. */
+    cfg = default_cfg();
+    cfg.friction_fp = 0;
+    cfg.fast_fp     = 145;
+    cfg.slow_fp     = 0;
+    cfg.decay_fast  = 900;
+    cfg.decay_slow  = 950;
+    cfg.decay_tail  = 950;
+    cfg.exact_magnitude = 1;
+    vy = 100; vx = 100;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    int32_t ey = vy, ex = vx;
+    cfg.exact_magnitude = 0;
+    vy = 100; vx = 100;
+    apply_decay_2d(&vy, &vx, &cfg, 1000, 0);
+    ASSERT_TRUE("exact path non-zero", ey != 0 && ex != 0);
+    ASSERT_TRUE("apply_decay_2d honours exact_magnitude",
+                ey != vy || ex != vx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -428,6 +543,9 @@ static void test_accumulate_and_emit(void) {
 int main(void) {
     printf("scroll_inertia math unit tests\n");
     test_fast_magnitude();
+    test_isqrt64();
+    test_exact_magnitude();
+    test_magnitude_dispatcher();
     test_clamp_velocity();
     test_safe_guards();
     test_update_velocity_ema();

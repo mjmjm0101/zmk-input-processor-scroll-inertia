@@ -162,7 +162,9 @@ struct scroll_inertia_data {
     int32_t tracking_count;
 
     /* Buffered non-tracked-axis value, awaiting merge into the
-     * tracked axis via fast_magnitude().  Single slot by design:
+     * tracked axis via magnitude() (the dispatcher — fast_magnitude
+     * approximation by default, exact Pythagorean when the
+     * `exact-magnitude` DT property is set).  Single slot by design:
      * input devices report X and Y in pairs, so the buffered value is
      * normally consumed by the very next event of the tracked axis.
      * If the same non-tracked axis fires twice in a row (rare), the
@@ -222,9 +224,9 @@ struct scroll_inertia_data {
      *
      * Per-axis (not a single magnitude) so each axis's taper starts at
      * 1.0 in AXIS_BOTH too: a diagonal coast where vel_y ≈ vel_x ≈ V
-     * and fast_magnitude ≈ 1.5V would otherwise leave each axis's
-     * taper at V / 1.5V ≈ 0.67, under-applying the commit-based loss
-     * on weakly-committed diagonal flicks. */
+     * and magnitude ≈ 1.5V (or √2·V in exact mode) would otherwise
+     * leave each axis's taper at ~0.67, under-applying the commit-based
+     * loss on weakly-committed diagonal flicks. */
     int32_t init_vel_y;
     int32_t init_vel_x;
 
@@ -362,13 +364,13 @@ static void to_coasting(struct scroll_inertia_data *data,
      * inertia starts at the speed the user was actually seeing the
      * moment release was detected, so there's no observable jump
      * between the tracking output and the coast.  Angle invariance
-     * still holds because fast_magnitude of (vel_x, vel_y) is
-     * symmetric — a 45° flick and an axis-aligned flick of the same
-     * physical strength both land on the same cur_mag here.  Guarded
-     * by `peak_* != 0` on the tracked axis so a pure cross-axis
-     * gesture doesn't get unsolicited Y/X inertia. */
+     * still holds because magnitude() (fast or exact) is symmetric
+     * in its arguments — a 45° flick and an axis-aligned flick of
+     * the same physical strength both land on the same cur_mag here.
+     * Guarded by `peak_* != 0` on the tracked axis so a pure
+     * cross-axis gesture doesn't get unsolicited Y/X inertia. */
     int32_t ax = effective_axis(cfg);
-    int32_t cur_mag = fast_magnitude(data->vel_x, data->vel_y);
+    int32_t cur_mag = magnitude(data->vel_x, data->vel_y, cfg);
     if (ax == AXIS_Y && data->peak_vel_y != 0) {
         int32_t sign = (data->peak_vel_y > 0) ? 1 : -1;
         data->vel_y = clamp_velocity(cur_mag * sign, cfg->limit_fp);
@@ -400,7 +402,7 @@ static void to_coasting(struct scroll_inertia_data *data,
     data->init_vel_y = abs32(data->vel_y);
     data->init_vel_x = abs32(data->vel_x);
     /* Magnitude taper reference for apply_decay_2d (AXIS_BOTH only). */
-    data->init_mag = fast_magnitude(data->vel_y, data->vel_x);
+    data->init_mag = magnitude(data->vel_y, data->vel_x, cfg);
 
     k_work_cancel_delayable(&data->stop_detect_work);
     data->state = SS_COASTING;
@@ -472,10 +474,12 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
 
     /* Arming check — uses the vector magnitude of the per-axis peaks
      * so that a sloppy-angle flick arms at the same overall strength
-     * as an axis-aligned one.  fast_magnitude ≈ sqrt(x²+y²) with a
-     * max ~12% error, plenty accurate for a threshold. */
-    int32_t peak_magnitude = fast_magnitude(data->peak_vel_x,
-                                            data->peak_vel_y);
+     * as an axis-aligned one.  Default `fast_magnitude` ≈ sqrt(x²+y²)
+     * with a max ~12% error (plenty accurate for a threshold); the
+     * `exact-magnitude` DT opt-in routes through the Pythagorean
+     * path for strict angle invariance. */
+    int32_t peak_magnitude = magnitude(data->peak_vel_x,
+                                       data->peak_vel_y, cfg);
     bool vel_armed = (peak_magnitude >= cfg->start_fp);
     /* post_coast bypasses min-events: after a real coast, the user's
      * next flick doesn't need to re-prove itself against the noise
@@ -491,7 +495,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
      * still slowing down overall; single-axis decel checks used to
      * miss those cases. */
     if (armed) {
-        int32_t cur_magnitude = fast_magnitude(data->vel_x, data->vel_y);
+        int32_t cur_magnitude = magnitude(data->vel_x, data->vel_y, cfg);
         bool decelerating = false;
         if (cur_magnitude <
                 (int64_t)peak_magnitude * cfg->decel_ratio / 1000) {
@@ -537,7 +541,7 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
  * gate.  In single-axis modes the tracked axis already holds the
  * vector magnitude after to_coasting, so the caller passes *axis_vel
  * unchanged.  In AXIS_BOTH the per-axis component is smaller than the
- * 2D coast speed, so the caller passes fast_magnitude(vel_y, vel_x)
+ * 2D coast speed, so the caller passes magnitude(vel_y, vel_x, cfg)
  * here — otherwise a diagonal coast would absorb weak events that
  * would have passed through in single-axis for the same physical
  * flick (pre-fix bug: mid-to-low speed diagonal coasts appeared to
@@ -698,7 +702,7 @@ static bool handle_tracked_in_coasting_both(struct scroll_inertia_data *data,
          * events that a single-axis coast of equal physical speed
          * would have passed through — the root cause of the axis=0
          * freeze on mid-to-low-speed coasts. */
-        int32_t mag = fast_magnitude(data->vel_y, data->vel_x);
+        int32_t mag = magnitude(data->vel_y, data->vel_x, cfg);
         return coast_same_dir(data, cfg, event, axis_vel, mag);
     }
 
@@ -876,7 +880,7 @@ static void inertia_tick_handler(struct k_work *work) {
      * gesture angle. */
     bool stopped;
     if (ax == AXIS_BOTH) {
-        stopped = fast_magnitude(data->vel_y, data->vel_x) < cfg->stop_fp;
+        stopped = magnitude(data->vel_y, data->vel_x, cfg) < cfg->stop_fp;
     } else {
         bool below_y = (ax == AXIS_X) || abs32(data->vel_y) < cfg->stop_fp;
         bool below_x = (ax == AXIS_Y) || abs32(data->vel_x) < cfg->stop_fp;
@@ -939,7 +943,7 @@ static void stop_detect_handler(struct k_work *work) {
 
     /* Same vector-magnitude basis as the in-event arming check — see
      * handle_tracked_in_tracking for the rationale. */
-    int32_t vel_magnitude = fast_magnitude(data->vel_x, data->vel_y);
+    int32_t vel_magnitude = magnitude(data->vel_x, data->vel_y, cfg);
     bool vel_ok = (vel_magnitude >= cfg->start_fp);
     bool mov_ok = data->total_movement >= cfg->move;
 
@@ -1002,8 +1006,8 @@ static int scroll_inertia_handle_event(const struct device *dev,
      * AXIS_BOTH never buffers, so pending_other stays zero there. */
     if (data->pending_other != 0 && event->value != 0) {
         int32_t sign = event->value >= 0 ? 1 : -1;
-        event->value = sign * fast_magnitude(event->value,
-                                              data->pending_other);
+        event->value = sign * magnitude(event->value,
+                                         data->pending_other, cfg);
         data->pending_other = 0;
     }
 
@@ -1093,6 +1097,7 @@ static struct zmk_input_processor_driver_api scroll_inertia_driver_api = {
         .gesture_timeout_ms = DT_INST_PROP(n, gesture_timeout),               \
         .suppress_limit     = DT_INST_PROP(n, suppress_limit),                \
         .handoff_ms         = DT_INST_PROP(n, handoff_ms),                    \
+        .exact_magnitude    = DT_INST_PROP(n, exact_magnitude),               \
     };                                                                        \
     DEVICE_DT_INST_DEFINE(n, scroll_inertia_init, NULL,                       \
                           &scroll_inertia_data_##n,                           \

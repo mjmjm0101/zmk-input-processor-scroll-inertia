@@ -54,10 +54,15 @@ properties:
     type: int
     default: 40
     description: |
-      Minimum peak vector velocity (scroll units, fast_magnitude of
-      peak_x and peak_y) to trigger inertia.  Angle-invariant: a
-      diagonal flick crosses the threshold at the same overall
-      physical strength as an axis-aligned one.
+      Minimum peak vector velocity (scroll units) to trigger inertia.
+      The comparison uses the magnitude of (peak_x, peak_y) — the
+      integer approximation max(|x|,|y|) + min/2 by default, or the
+      exact Pythagorean value when `exact-magnitude` is set.
+      Angle-invariant either way: a diagonal flick crosses the
+      threshold at the same overall physical strength as an
+      axis-aligned one (exact mode is strictly equal; default mode
+      equal within the approximation's ~0–12% overestimate of
+      diagonals).
   move:
     type: int
     default: 80
@@ -294,6 +299,35 @@ properties:
       TRACKING.  50 events ≈ 400 ms at 125 Hz.  Recommended range
       [20, 200].  Low values cause needless drop-outs on valid long
       coasts; high values let stuck states persist longer.
+  exact-magnitude:
+    type: boolean
+    description: |
+      Use the exact Pythagorean formula sqrt(x² + y²) for every
+      vector-magnitude computation (arming threshold, deceleration
+      ratio, stop gate, same-direction coast comparison, cross-axis
+      merge, and AXIS_BOTH decay).  When unset (the default), the
+      processor uses the integer approximation max(|x|,|y|) + min/2,
+      which is up to ~12% over the true magnitude at atan(1/2) and
+      +6% at 45°.
+
+      Enable this when you want strictly angle-invariant behaviour —
+      a diagonal flick arms and stops at exactly the same physical
+      speed as an axis-aligned one, and a diagonal roll produces
+      scroll output matching sqrt(x²+y²) rather than slightly inflated
+      values.
+
+      Tuning note: the existing `start` / `stop` / `decel-ratio` /
+      `suppress-limit` defaults were chosen against the approximation.
+      Turning this on makes those thresholds effectively ~6% stricter
+      for off-axis input (true magnitude is lower than approximation).
+      In practice this is usually imperceptible, but if arming on
+      diagonal flicks feels less eager after enabling, lower `start`
+      by ~6% to compensate.
+
+      Integer-only — no libm dependency, uses Newton's iteration.
+      Cost is a handful of extra cycles per magnitude call; negligible
+      at typical 8 ms tick rates.
+
   handoff-ms:
     type: int
     default: 100

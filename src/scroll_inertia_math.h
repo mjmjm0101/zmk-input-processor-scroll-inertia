@@ -61,18 +61,68 @@ struct scroll_inertia_config {
     int32_t gesture_timeout_ms;
     int32_t suppress_limit;
     int32_t handoff_ms;
+
+    /* When non-zero, all magnitude computations use the exact
+     * Pythagorean formula sqrt(a² + b²) instead of the fast_magnitude
+     * approximation (max + min/2, up to ~12% over the true magnitude
+     * at atan(1/2) and +6% at 45°).  The exact path makes thresholds
+     * (start, stop, decel_ratio, suppress) and the cross-axis merge
+     * strictly angle-invariant; the approximation keeps the original
+     * integer-only hot path.  Opt-in via the DT `exact-magnitude`
+     * boolean; default is the approximation. */
+    int32_t exact_magnitude;
 };
 
 static inline int32_t abs32(int32_t v) { return v < 0 ? -v : v; }
 
 /* Integer approximation of sqrt(a² + b²).
- * Uses max(|a|,|b|) + min(|a|,|b|)/2  (max error ~12%). */
+ * Uses max(|a|,|b|) + min(|a|,|b|)/2  (max error ~12% at atan(1/2),
+ * +6% at 45°; always overestimates, so a diagonal is never *smaller*
+ * than the true magnitude). */
 static inline int32_t fast_magnitude(int32_t a, int32_t b) {
     int32_t aa = abs32(a);
     int32_t bb = abs32(b);
     int32_t hi = aa > bb ? aa : bb;
     int32_t lo = aa > bb ? bb : aa;
     return hi + (lo >> 1);
+}
+
+/* Integer square root of a non-negative 64-bit value, rounded down.
+ * Newton's iteration converges in ≤ 6 steps for inputs up to the
+ * int64 range.  Kept integer-only to preserve the codebase's no-libm
+ * policy; FPU-enabled ZMK targets would be marginally faster with
+ * sqrtf, but the savings don't justify the libm dependency. */
+static inline int32_t isqrt64(int64_t n) {
+    if (n <= 0) return 0;
+    int64_t x = n;
+    int64_t y = (x + 1) >> 1;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) >> 1;
+    }
+    return (int32_t)x;
+}
+
+/* Exact integer magnitude: floor(sqrt(a² + b²)).
+ * int64 intermediate so inputs near limit_fp don't overflow
+ * (limit_fp can reach ~limit * 256, whose square exceeds int32). */
+static inline int32_t exact_magnitude(int32_t a, int32_t b) {
+    int64_t aa = (int64_t)a * a;
+    int64_t bb = (int64_t)b * b;
+    return isqrt64(aa + bb);
+}
+
+/* Magnitude dispatcher.  All internal call sites that used to invoke
+ * fast_magnitude directly now route through this so a single DT
+ * property (`exact-magnitude`) flips every threshold comparison and
+ * the cross-axis merge at once.  The default path (cfg->exact_magnitude
+ * == 0) compiles to a predictable branch plus the original fast
+ * inline, so host tests calling fast_magnitude directly still measure
+ * the same numeric invariants. */
+static inline int32_t magnitude(int32_t a, int32_t b,
+                                const struct scroll_inertia_config *cfg) {
+    if (cfg->exact_magnitude) return exact_magnitude(a, b);
+    return fast_magnitude(a, b);
 }
 
 static inline int32_t clamp_velocity(int32_t vel, int32_t limit_fp) {
@@ -223,7 +273,7 @@ static inline void apply_decay_2d(int32_t *vel_y, int32_t *vel_x,
                                   const struct scroll_inertia_config *cfg,
                                   int32_t commit_permille,
                                   int32_t init_mag) {
-    int32_t mag = fast_magnitude(*vel_y, *vel_x);
+    int32_t mag = magnitude(*vel_y, *vel_x, cfg);
     if (mag == 0) return;
 
     int32_t d = select_decay_rate(mag, cfg);

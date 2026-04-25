@@ -295,10 +295,18 @@ properties:
     default: 50
     description: |
       Hard safety limit: if this many consecutive same-direction
-      events are absorbed in COASTING, force a transition back to
-      TRACKING.  50 events ≈ 400 ms at 125 Hz.  Recommended range
-      [20, 200].  Low values cause needless drop-outs on valid long
-      coasts; high values let stuck states persist longer.
+      events are *absorbed* in COASTING (event speed at or below the
+      current inertia, so they're consumed silently rather than passed
+      downstream), force a transition back to TRACKING.  50 events
+      ≈ 400 ms at 125 Hz.  Recommended range [20, 200].  Low values
+      cause needless drop-outs on valid long coasts; high values let
+      stuck states persist longer.
+
+      Bumps (event speed above the inertia, where the user is driving
+      the coast) are not counted: they're the opposite of the stuck
+      state this limit detects, and counting them would let a strong
+      flick's long natural-decay tail trip the limit and cancel its
+      own inertia mid-gesture.
   exact-magnitude:
     type: boolean
     description: |

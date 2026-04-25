@@ -180,10 +180,18 @@ struct scroll_inertia_data {
 
     int64_t inertia_start_time;
 
-    /* Consecutive same-direction events absorbed in COASTING.  Reset
-     * on any cross-axis or state change.  Hitting suppress-limit
-     * transitions back to TRACKING on the assumption that the user
-     * has been actively rolling past a stale coast. */
+    /* Consecutive same-direction events *absorbed* in COASTING (event
+     * speed at or below the current inertia, so the event is consumed
+     * silently rather than passed downstream).  Reset on any cross-axis
+     * or state change.  Hitting suppress-limit transitions back to
+     * TRACKING on the assumption that the user has been actively
+     * rolling past a stale coast.
+     *
+     * Bumps (event speed *above* the inertia) are *not* counted here:
+     * a bump is the user driving the coast, the opposite of the
+     * stuck-coast situation suppress_limit is designed to escape.
+     * Counting bumps would let a strong flick's long natural-decay
+     * tail trip the limit and cancel its own inertia mid-gesture. */
     int32_t suppress_count;
 
     /* Cumulative |delta| of cross-axis input seen while in COASTING.
@@ -550,7 +558,8 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
  *
  * Returns true when the event should pass through downstream, false
  * when it was consumed (value zeroed).  suppress_limit → TRACKING
- * drop-back is handled internally.
+ * drop-back fires from the absorb branch only; see suppress_count's
+ * field comment for why bumps are excluded from the count.
  *
  * Bump.  The ball's natural deceleration may briefly fluctuate above
  * the (faster-decaying) inertia velocity — bump the inertia velocity
@@ -563,6 +572,10 @@ static bool handle_tracked_in_tracking(struct scroll_inertia_data *data,
  * would kill the inertia mid-gesture on a long series of restarts.
  * The start_fp gate keeps the reset from firing on ball-tail jitter
  * (which is well below the arming threshold).
+ * Bumps don't accumulate suppress_count: a bump means the user is
+ * driving the coast (the very opposite of the stuck-coast situation
+ * suppress_limit detects), so a strong flick's long natural-decay
+ * tail won't trip the limit and cancel its own inertia.
  *
  * Below-coast same-direction event has two sub-cases:
  *   (1) Within the handoff window, OR event velocity sits close to
@@ -602,12 +615,15 @@ static bool coast_same_dir(struct scroll_inertia_data *data,
             data->commit_permille = 1000;
         }
         event->value = 0;
-        data->suppress_count++;
-        if (data->suppress_count >= cfg->suppress_limit) {
-            /* Long same-direction absorption — user has been actively
-             * rolling past a stale coast.  Drop back to TRACKING. */
-            to_tracking_from_coasting(data);
-        }
+        /* Bump means the user is *driving* the coast (event speed exceeds
+         * the current inertia), not fighting it — the opposite of the
+         * "stuck-coast" stuck-state suppress_limit was designed to detect.
+         * Don't accumulate suppress_count here, otherwise a strong flick's
+         * long natural-decay tail (which produces many above-coast events)
+         * trips suppress_limit mid-gesture and cancels its own inertia.
+         * The runaway safety cap is `span_ms`, which is re-seated above
+         * for fresh flicks; sustained bumps at sub-start_fp speeds rely
+         * on natural decay below `stop` to terminate. */
         return false;
     }
 

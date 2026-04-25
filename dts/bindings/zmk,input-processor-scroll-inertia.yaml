@@ -207,8 +207,17 @@ properties:
     type: int
     default: -1
     description: |
-      Scroll layer index.  When >= 0, inertia stops immediately if this
-      layer becomes inactive.  -1 = no layer check.
+      Scroll layer index.  When >= 0, all internal state is reset the
+      moment this layer turns off — driven by ZMK's
+      layer_state_changed event, so cleanup is immediate and does not
+      depend on the inertia `tick` interval (a sub-tick layer toggle
+      otherwise risks leaving stale COASTING state that silently
+      absorbs the first events of the next session, looking like a
+      "scroll lock on layer entry" symptom).  The inertia tick keeps
+      a redundant layer-active check as a belt-and-suspenders fallback.
+      -1 = no layer check (state is then only reset by gesture
+      timeout, stale-inertia, or natural decay; not recommended for
+      typical scroll-layer setups).
   swap-mod:
     type: int
     default: 0

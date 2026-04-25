@@ -30,6 +30,9 @@
  *                        and keeps coasting; transition fires only
  *                        when both axes are dead, or on suppress-limit
  *   COASTING → IDLE      vel < stop, span exceeded, layer off
+ *                        (detected by both the inertia tick and a
+ *                        layer_state_changed subscription, so a sub-
+ *                        tick layer toggle can't leave stale state)
  *   any → IDLE           gesture timeout, or stale inertia
  *                        (see should_reset_on_timeout)
  *
@@ -74,6 +77,8 @@
 #include <zmk/hid.h>
 #include <zmk/endpoints.h>
 #include <zmk/keymap.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/layer_state_changed.h>
 
 #include "scroll_inertia_math.h"
 
@@ -1122,3 +1127,48 @@ static struct zmk_input_processor_driver_api scroll_inertia_driver_api = {
                           &scroll_inertia_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(SCROLL_INERTIA_INST)
+
+/* ------------------------------------------------------------------ */
+/* Layer-state cleanup                                                 */
+/* ------------------------------------------------------------------
+ * Subscribe to ZMK's layer_state_changed event so a layer turning OFF
+ * resets every matching instance's state immediately, regardless of
+ * the inertia tick interval.
+ *
+ * Without this, a sub-tick layer toggle (OFF then ON faster than
+ * `tick` ms) leaves the cleanup tick scheduled for after the layer
+ * is back ON.  When that tick fires it sees the layer active and
+ * keeps coasting, so leftover COASTING from the previous session
+ * silently absorbs the user's first new-session events — looking
+ * exactly like a "scroll lock on layer entry" symptom that only
+ * resolves when the ball stops and the natural decay drops the
+ * coast below `stop`.
+ *
+ * The handler is global (one listener for the whole driver) and
+ * iterates every instantiated instance via DT_INST_FOREACH, matching
+ * each instance's own `cfg->layer` against the event's layer.  No
+ * hard-coded layer numbers — `cfg->layer = -1` (the default "no layer
+ * gate" setting) won't match any real layer index, so those instances
+ * are naturally ignored.
+ *
+ * All callbacks (input event, inertia tick, stop_detect, this layer
+ * listener) run on the system workqueue, so they're serialised w.r.t.
+ * the per-instance state — no extra locking needed beyond the
+ * concurrency model documented at the top of the file. */
+#define SCROLL_INERTIA_LAYER_OFF_RESET(n)                                     \
+    if (scroll_inertia_config_##n.layer == ev->layer) {                       \
+        to_idle(&scroll_inertia_data_##n);                                    \
+    }
+
+static int scroll_inertia_layer_cb(const zmk_event_t *eh) {
+    const struct zmk_layer_state_changed *ev = as_zmk_layer_state_changed(eh);
+    if (ev == NULL || ev->state) {
+        /* Not our event, or layer turning ON — nothing to clean. */
+        return 0;
+    }
+    DT_INST_FOREACH_STATUS_OKAY(SCROLL_INERTIA_LAYER_OFF_RESET)
+    return 0;
+}
+
+ZMK_LISTENER(scroll_inertia, scroll_inertia_layer_cb);
+ZMK_SUBSCRIPTION(scroll_inertia, zmk_layer_state_changed);

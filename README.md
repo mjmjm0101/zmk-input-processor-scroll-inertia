@@ -514,6 +514,10 @@ Three timing-based checks can force a transition back to IDLE from any state:
   The coast has detached from the physical gesture; end it.
 - **Cross-axis break** (cumulative cross-axis motion exceeding `move` during coasting, in single-axis mode).
   The user is actively rolling the untracked axis — give them direct control.
+- **Layer-off cleanup** (when `layer` is set, the bound layer turning off).
+  Driven by ZMK's `layer_state_changed` event so cleanup happens the instant the layer toggles off, independent of `tick`.
+  The inertia tick keeps a redundant layer-active check as a fallback.
+  Without this immediate path, a sub-tick layer toggle (off/on faster than `tick` ms) could leave stale COASTING that silently absorbs the next session's first events.
 
 ### Safety
 

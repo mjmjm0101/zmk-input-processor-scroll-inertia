@@ -125,6 +125,12 @@ projects:
     import: app/west.yml
 ```
 
+### ⚠️ Sensor drivers
+
+Needless to say, use the **official upstream driver** for each sensor.
+If you use a third-party / modified driver, you must **turn off its built-in inertial-scroll feature**.
+Running its inertia in parallel with this module can break the coast or even drop the BLE link.
+
 ### `*.conf`
 
 Nothing is strictly required — the module turns itself on when it sees a matching node in your overlay, and `CONFIG_ZMK_POINTING` is auto-selected by the module's Kconfig (it's needed for the mouse HID API this processor emits through).

@@ -57,6 +57,11 @@ That guessing works most of the time but breaks down at:
 - Direction reversals (the previous direction's peak misleads the guess)
 - Slow drift (noise looks like signal)
 - The handoff between active scroll and inertia (state has to carry over correctly)
+- Releasing the axis lock (whether from a misjudgement or a deliberate
+  axis change by the user, the lock persists until the firmware
+  accumulates enough evidence to release it — and there is no
+  input-level signal that distinguishes "wrong guess" from "user
+  changed their mind")
 
 These aren't bugs you can fix — they happen because the firmware is trying to read information that simply isn't in the input.
 
